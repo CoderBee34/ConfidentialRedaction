@@ -2,7 +2,6 @@
 Examples:
     py row_redactor.py input/input.pdf "2013/8024"
     py row_redactor.py input/input.pdf "AHMET" "ULVIHANOGLU" -o redacted.pdf
-    py row_redactor.py input/input.pdf --keep-file keep_rows.txt --dry-run
 """
 
 import sys
@@ -289,7 +288,7 @@ def redact_rows(image, rows, keep_indices, padding=2):
                 y0 = max(w["top"] - padding, 0)
                 x1 = min(w["left"] + w["width"] + padding, image.size[0])
                 y1 = min(w["top"] + w["height"] + padding, image.size[1])
-                draw.rectangle([x0, y0, x1, y1], fill="black")
+                draw.rectangle([x0, y0, x1, y1], fill="grey")
 
     return image, kept_rows, redacted_rows
 
