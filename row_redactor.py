@@ -271,10 +271,18 @@ def _detect_lines(binary, direction, min_ratio=0.10, merge_gap=8):
 
 
 def _binarise(pil_image, threshold=128):
-    """Convert a PIL image to a binarised numpy array (ink = 255)."""
+    """Convert a PIL image to a binarised numpy array (ink = 255).
+
+    Uses adaptive Gaussian thresholding so uneven lighting, shadows,
+    and photo gradients are handled correctly.  The *threshold*
+    parameter is retained for API compatibility but unused.
+    """
     img_np = np.array(pil_image)
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-    _, binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
+    binary = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 11, 2
+    )
     return binary
 
 
