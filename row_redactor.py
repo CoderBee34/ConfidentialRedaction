@@ -49,21 +49,183 @@ def get_ocr_words(image):
 
 
 def normalize(text):
-    """Normalize text for fuzzy comparison: lowercase, strip edge punctuation."""
+    """Normalize text for comparison: lowercase, strip edge punctuation."""
     t = text.strip().lower()
     t = re.sub(r"^[^\w]+", "", t)
     t = re.sub(r"[^\w]+$", "", t)
     return t
 
 
-def build_search_set(search_texts):
-    search_words = set()
-    for phrase in search_texts:
-        for word in phrase.split():
-            n = normalize(word)
-            if n:
-                search_words.add(n)
-    return search_words
+# ── Fuzzy matching helpers ────────────────────────────────────────────────────
+
+# Common OCR confusion pairs (both directions are checked automatically)
+_OCR_CONFUSIONS = {
+    '0': 'o', 'o': '0',
+    '1': 'l', 'l': '1',
+    'i': '1', '1': 'i',
+    'i': 'ı', 'ı': 'i',
+    '5': 's', 's': '5',
+    '8': 'b', 'b': '8',
+    'ğ': 'g', 'g': 'ğ',
+    'ü': 'u', 'u': 'ü',
+    'ö': 'o',
+    'ş': 's',
+    'ç': 'c', 'c': 'ç',
+    'â': 'a',
+    'î': 'i',
+    'û': 'u',
+}
+
+
+def _char_match(a, b):
+    """Return True if characters *a* and *b* are identical or OCR-confusable."""
+    if a == b:
+        return True
+    return _OCR_CONFUSIONS.get(a) == b or _OCR_CONFUSIONS.get(b) == a
+
+
+def _edit_distance(s1, s2, max_dist=None):
+    """
+    Compute edit distance between *s1* and *s2* with OCR-aware
+    character substitutions (OCR-confusable chars cost 0).
+
+    Uses early termination when the distance exceeds *max_dist*.
+    """
+    len1, len2 = len(s1), len(s2)
+    if max_dist is not None and abs(len1 - len2) > max_dist:
+        return max_dist + 1
+
+    # Use single-row DP
+    prev = list(range(len2 + 1))
+    for i in range(1, len1 + 1):
+        curr = [i] + [0] * len2
+        row_min = i
+        for j in range(1, len2 + 1):
+            if _char_match(s1[i - 1], s2[j - 1]):
+                cost = 0
+            else:
+                cost = 1
+            curr[j] = min(
+                curr[j - 1] + 1,       # insertion
+                prev[j] + 1,            # deletion
+                prev[j - 1] + cost,     # substitution
+            )
+            row_min = min(row_min, curr[j])
+        if max_dist is not None and row_min > max_dist:
+            return max_dist + 1
+        prev = curr
+    return prev[len2]
+
+
+def _fuzzy_word_match(search_word, ocr_word, threshold=None):
+    """
+    Return True if *search_word* fuzzy-matches *ocr_word*.
+
+    The allowed edit distance scales with word length:
+      - len ≤ 3:  exact match only (threshold 0)
+      - len 4–6:  up to 1 edit
+      - len 7–10: up to 2 edits
+      - len > 10: up to 3 edits
+
+    OCR-confusable character substitutions cost 0 edits.
+    Also returns True if one is a substring of the other (handles
+    OCR merging/splitting artefacts).
+    """
+    if search_word == ocr_word:
+        return True
+
+    # Substring containment (OCR sometimes merges or splits words)
+    if search_word in ocr_word or ocr_word in search_word:
+        return True
+
+    if threshold is None:
+        max_len = max(len(search_word), len(ocr_word))
+        if max_len <= 3:
+            threshold = 0
+        elif max_len <= 6:
+            threshold = 1
+        elif max_len <= 10:
+            threshold = 2
+        else:
+            threshold = 3
+
+    dist = _edit_distance(search_word, ocr_word, max_dist=threshold)
+    return dist <= threshold
+
+
+def _phrase_fuzzy_match(search_phrase, grouped_words):
+    """
+    Check if a search phrase (tuple of normalised words) fuzzy-matches
+    within a group of OCR words (also a tuple of normalised words).
+
+    Tries to find a contiguous or near-contiguous subsequence in
+    *grouped_words* that matches all words of *search_phrase* in order.
+    Also handles the case where OCR merged two search words into one
+    OCR token or split one search word across two OCR tokens.
+    """
+    n_search = len(search_phrase)
+    n_group = len(grouped_words)
+
+    if n_search == 0:
+        return True
+
+    if n_search == 1:
+        # Single-word phrase: fuzzy match against any word in the group
+        sw = search_phrase[0]
+        return any(_fuzzy_word_match(sw, gw) for gw in grouped_words)
+
+    # Multi-word phrase: try sliding window + flexible matching
+    # Allow the matched span to be slightly wider than the search phrase
+    # (OCR may split a word into two tokens)
+    for start in range(n_group):
+        si = 0  # index into search_phrase
+        gi = start  # index into grouped_words
+        while si < n_search and gi < n_group:
+            sw = search_phrase[si]
+            gw = grouped_words[gi]
+            if _fuzzy_word_match(sw, gw):
+                si += 1
+                gi += 1
+            elif gi + 1 < n_group:
+                # Try matching search word against two merged OCR words
+                merged = grouped_words[gi] + grouped_words[gi + 1]
+                if _fuzzy_word_match(sw, merged):
+                    si += 1
+                    gi += 2
+                    continue
+                # Try matching two search words against one OCR word
+                if si + 1 < n_search:
+                    merged_search = search_phrase[si] + search_phrase[si + 1]
+                    if _fuzzy_word_match(merged_search, gw):
+                        si += 2
+                        gi += 1
+                        continue
+                break
+            else:
+                break
+        if si >= n_search:
+            return True
+
+    return False
+
+
+def build_search_phrases(search_texts):
+    """
+    Build a list of normalised search phrases.  Each input string is
+    treated as a full phrase (e.g. a person's full name) and kept
+    intact as a tuple of normalised words.
+
+    Example
+    -------
+    >>> build_search_phrases(["Lale Bilge Deniz", "2013/8024"])
+    [('lale', 'bilge', 'deniz'), ('2013/8024',)]
+    """
+    phrases = []
+    for text in search_texts:
+        words = [normalize(w) for w in text.split() if normalize(w)]
+        if words:
+            phrases.append(tuple(words))
+    return phrases
 
 
 # ── Line detection (table grid) ──────────────────────────────────────────────
@@ -525,12 +687,176 @@ def build_rows_from_words(words, img_height, y_tolerance=None):
     return rows
 
 
-def row_matches_search(row, search_set):
-    """Return True if ANY word in the row matches ANY word in search_set."""
-    for w in row["words"]:
-        n = normalize(w["text"])
-        if n and n in search_set:
-            return True
+def _group_words_into_phrases(row_words, gap_factor=2.5):
+    """
+    Group words in a row into phrases based on x-axis proximity.
+    Words that are close together horizontally (like first name,
+    middle name, last name) are merged into a single phrase string.
+
+    Parameters
+    ----------
+    row_words : list[dict]
+        Words already sorted left → right.
+    gap_factor : float
+        A gap larger than ``gap_factor × median_word_width`` starts
+        a new phrase.
+
+    Returns
+    -------
+    list[str]   Normalised phrase strings.
+    """
+    if not row_words:
+        return []
+
+    # Compute gaps between consecutive words
+    gaps = []
+    for i in range(len(row_words) - 1):
+        right_edge = row_words[i]["left"] + row_words[i]["width"]
+        left_edge = row_words[i + 1]["left"]
+        gaps.append(max(left_edge - right_edge, 0))
+
+    if gaps:
+        # Use median word width to set threshold
+        widths = sorted(w["width"] for w in row_words if w["width"] > 0)
+        median_w = widths[len(widths) // 2] if widths else 20
+        gap_threshold = median_w * gap_factor
+    else:
+        gap_threshold = 0
+
+    # Group words into phrases by splitting at large gaps
+    phrases = []
+    current_phrase_words = [row_words[0]["text"]]
+    for i, gap in enumerate(gaps):
+        if gap > gap_threshold:
+            phrases.append(" ".join(current_phrase_words))
+            current_phrase_words = [row_words[i + 1]["text"]]
+        else:
+            current_phrase_words.append(row_words[i + 1]["text"])
+    phrases.append(" ".join(current_phrase_words))
+
+    # Normalise each phrase into a tuple of normalised words
+    result = []
+    for p in phrases:
+        norm_words = tuple(normalize(w) for w in p.split() if normalize(w))
+        if norm_words:
+            result.append(norm_words)
+    return result
+
+
+def _word_match_score(search_word, ocr_word):
+    """
+    Return a match score between 0.0 and 1.0 for a single word pair.
+    Higher is better.  0.0 means no match.
+    """
+    if search_word == ocr_word:
+        return 1.0
+    if search_word in ocr_word or ocr_word in search_word:
+        shorter = min(len(search_word), len(ocr_word))
+        longer = max(len(search_word), len(ocr_word))
+        return 0.85 * (shorter / longer)
+
+    max_len = max(len(search_word), len(ocr_word))
+    if max_len <= 3:
+        threshold = 0
+    elif max_len <= 6:
+        threshold = 1
+    elif max_len <= 10:
+        threshold = 2
+    else:
+        threshold = 3
+
+    dist = _edit_distance(search_word, ocr_word, max_dist=threshold)
+    if dist > threshold:
+        return 0.0
+    return max(0.0, 1.0 - dist / max(max_len, 1))
+
+
+def _row_match_score(row, search_phrases):
+    """
+    Compute an aggregate match score for a row against all search
+    phrases.  The score is the sum of the best per-phrase scores.
+
+    For single-word phrases, the best fuzzy word score across all
+    row words is used.  For multi-word phrases, the average of
+    per-word best scores within each proximity group is used.
+
+    Returns 0.0 if the row doesn't match at all.
+    """
+    if not search_phrases:
+        return 0.0
+
+    row_grouped = _group_words_into_phrases(row["words"])
+    all_row_words = [normalize(w["text"]) for w in row["words"]
+                     if normalize(w["text"])]
+
+    total = 0.0
+    matched_any = False
+
+    for search_phrase in search_phrases:
+        best_phrase_score = 0.0
+
+        if len(search_phrase) == 1:
+            sw = search_phrase[0]
+            for rw in all_row_words:
+                s = _word_match_score(sw, rw)
+                best_phrase_score = max(best_phrase_score, s)
+        else:
+            for grouped in row_grouped:
+                if not _phrase_fuzzy_match(search_phrase, grouped):
+                    continue
+                # Score each search word against the best in the group
+                word_scores = []
+                for sw in search_phrase:
+                    best_w = max((_word_match_score(sw, gw) for gw in grouped),
+                                 default=0.0)
+                    word_scores.append(best_w)
+                avg = sum(word_scores) / len(word_scores) if word_scores else 0.0
+                best_phrase_score = max(best_phrase_score, avg)
+
+        if best_phrase_score > 0.0:
+            matched_any = True
+        total += best_phrase_score
+
+    return total if matched_any else 0.0
+
+
+def row_matches_search(row, search_phrases):
+    """
+    Return True if ANY search phrase fuzzy-matches within the row.
+
+    Multi-word phrases are matched against x-proximity word groups
+    (so "Lale Bilge Deniz" must appear together).  Single-word
+    phrases are matched against every individual word in the row.
+
+    Uses OCR-aware fuzzy matching (edit distance with confusion
+    pairs, substring containment, merge/split handling).
+
+    Parameters
+    ----------
+    row : dict
+        Row dict with a ``words`` list (sorted left → right).
+    search_phrases : list[tuple[str]]
+        Normalised search phrases from :func:`build_search_phrases`.
+    """
+    if not search_phrases:
+        return False
+
+    row_grouped = _group_words_into_phrases(row["words"])
+    # Also build a flat list of all normalised words for single-word matching
+    all_row_words = tuple(normalize(w["text"]) for w in row["words"]
+                          if normalize(w["text"]))
+
+    for search_phrase in search_phrases:
+        if len(search_phrase) == 1:
+            # Single-word: match against any word in the entire row
+            if any(_fuzzy_word_match(search_phrase[0], rw)
+                   for rw in all_row_words):
+                return True
+        else:
+            # Multi-word: must match within a single proximity group
+            for grouped in row_grouped:
+                if _phrase_fuzzy_match(search_phrase, grouped):
+                    return True
     return False
 
 
@@ -563,7 +889,7 @@ def redact_rows(image, rows, keep_indices, padding=2):
     return image, kept_rows, redacted_rows
 
 
-def process_page(image, search_set, padding=2):
+def process_page(image, search_phrases, padding=2):
     """
     Full pipeline for one page:
       1.  Auto-detect & normalise orientation
@@ -571,7 +897,7 @@ def process_page(image, search_set, padding=2):
       3.  OCR  →  words
       4.  Assign words to rows
       5.  Row 0  =  header  (always kept)
-      6.  Find rows matching search terms
+      6.  Find rows matching search phrases
       7.  Redact everything else
       8.  Rotate back to original orientation
     """
@@ -597,24 +923,34 @@ def process_page(image, search_set, padding=2):
     # Always keep the header (first row with actual content)
     keep_indices = {0}
 
-    # Find rows that contain any of the search words
+    # Score all rows and pick the single best match
+    best_idx = None
+    best_score = 0.0
     for i, row in enumerate(rows):
-        if row_matches_search(row, search_set):
-            keep_indices.add(i)
+        if i == 0:
+            continue  # header already kept
+        score = _row_match_score(row, search_phrases)
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    if best_idx is not None:
+        keep_indices.add(best_idx)
+        print(f"    Best matching row: {best_idx} (score {best_score:.3f})")
 
     redacted_img, kept_rows, redacted_rows = redact_rows(
         normalised, rows, keep_indices, padding=padding
     )
 
     # Rotate back to original orientation
-    result = undo_rotation(redacted_img, rotation)
+    result = redacted_img #undo_rotation(redacted_img, rotation)
     return result, kept_rows, redacted_rows, rows, h_lines, rotation
 
 
 def process_pdf(input_path, output_path, search_texts, dpi=200, padding=2):
     """Main processing pipeline: detect grid, OCR, match rows, redact."""
-    search_set = build_search_set(search_texts)
-    print(f"Search words (normalized): {search_set}\n")
+    search_phrases = build_search_phrases(search_texts)
+    print(f"Search phrases (normalized): {search_phrases}\n")
 
     doc = fitz.open(input_path)
     redacted_images = []
@@ -627,7 +963,7 @@ def process_pdf(input_path, output_path, search_texts, dpi=200, padding=2):
         print(f"  Image size: {image.size[0]}x{image.size[1]} px")
 
         redacted_img, kept_rows, redacted_rows, rows, h_lines, rotation = \
-            process_page(image, search_set, padding=padding)
+            process_page(image, search_phrases, padding=padding)
 
         print(f"  Rotation applied: {rotation} deg")
         print(f"  Horizontal lines detected: {len(h_lines)}")
@@ -744,7 +1080,7 @@ def main():
         args.output = f"{base}_redacted{ext}"
 
     # ── Summary ───────────────────────────────────────────────────────────
-    search_set = build_search_set(search_texts)
+    search_phrases = build_search_phrases(search_texts)
     print("=" * 60)
     print("PDF Table Row Redaction Tool")
     print("=" * 60)
@@ -753,7 +1089,7 @@ def main():
     print(f"  DPI:        {args.dpi}")
     print(f"  Padding:    {args.padding}px")
     print(f"  Search for: {search_texts}")
-    print(f"  Normalized: {search_set}")
+    print(f"  Phrases:    {search_phrases}")
     if args.dry_run:
         print("  Mode:       DRY RUN (no output will be saved)")
     print("=" * 60)
@@ -785,18 +1121,33 @@ def main():
             rows = build_rows_from_words(table_words, normalised.size[1])
 
             print(f"  Rows detected: {len(rows)}\n")
+            best_idx = None
+            best_score = 0.0
+            for i, row in enumerate(rows):
+                if i > 0:
+                    score = _row_match_score(row, search_phrases)
+                    if score > best_score:
+                        best_score = score
+                        best_idx = i
+
             for i, row in enumerate(rows):
                 is_header = (i == 0)
-                matches = row_matches_search(row, search_set)
                 if is_header:
                     status = "HEADER (keep)"
-                elif matches:
-                    status = "MATCH  (keep)"
+                elif i == best_idx:
+                    status = f"BEST   (keep)"
                 else:
-                    status = "REDACT"
+                    score = _row_match_score(row, search_phrases)
+                    if score > 0:
+                        status = f"match  s={score:.2f}"
+                    else:
+                        status = "REDACT"
                 print(f"  Row {i:3d} [{status:14s}]  "
                       f"y={row['y_min']:4d}-{row['y_max']:4d}  "
                       f"{row['text'][:100]}")
+            if best_idx is not None:
+                print(f"\n  -> Best match: Row {best_idx} "
+                      f"(score {best_score:.3f})")
         doc.close()
         print("\nDry run complete. No file was saved.")
 
