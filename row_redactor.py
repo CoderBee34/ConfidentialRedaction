@@ -30,7 +30,7 @@ def pdf_page_to_image(page, dpi=300):
 
 def get_ocr_words(image):
     """Run OCR on an image and return word-level bounding box data."""
-    data = pytesseract.image_to_data(image, output_type=Output.DICT)
+    data = pytesseract.image_to_data(image, lang="tur", output_type=Output.DICT)
     words = []
     for i in range(len(data["text"])):
         text = data["text"][i].strip()
@@ -57,7 +57,6 @@ def normalize(text):
 
 
 def build_search_set(search_texts):
-
     search_words = set()
     for phrase in search_texts:
         for word in phrase.split():
@@ -199,54 +198,205 @@ def undo_rotation(pil_image, rotation_applied):
     return pil_image.rotate(undo_angle, expand=True)
 
 
-# ── Row building from grid lines ─────────────────────────────────────────────
+# ── Column detection & tilt estimation ────────────────────────────────────────
 
 
-def build_rows_from_lines(h_lines, words, img_height):
+def _detect_columns(words, x_tolerance=None):
     """
-    Given a list of horizontal line y-positions and OCR words,
-    build table rows by assigning words to the band between consecutive
-    horizontal lines.
+    Cluster words into vertical columns by their horizontal centre.
 
-    Returns a list of row dicts sorted top → bottom:
-        {
-            "y_min": int,          # top boundary (line above)
-            "y_max": int,          # bottom boundary (line below)
-            "words": [word, ...],
-            "text":  str,
-        }
+    Returns a list of columns, each a list of word dicts sorted by y-centre
+    (top → bottom).  Columns are sorted left → right.
     """
-    if len(h_lines) < 2:
-        # Fallback: treat the whole page as a single row
-        text = " ".join(w["text"] for w in words)
-        return [{
-            "y_min": 0,
-            "y_max": img_height,
-            "words": list(words),
-            "text": text,
-        }]
+    if not words:
+        return []
 
-    # Bands between consecutive lines define rows
-    bands = []
-    for i in range(len(h_lines) - 1):
-        bands.append((h_lines[i], h_lines[i + 1]))
+    # Sort words by x-centre
+    by_x = sorted(words, key=lambda w: w["left"] + w["width"] / 2)
 
-    # Assign each word to the band whose range contains the word's vertical centre
+    # Derive x_tolerance from gap distribution
+    if x_tolerance is None:
+        centres = [w["left"] + w["width"] / 2 for w in by_x]
+        if len(centres) >= 2:
+            gaps = [centres[i + 1] - centres[i] for i in range(len(centres) - 1)]
+            gaps_sorted = sorted(gaps)
+            median_gap = gaps_sorted[len(gaps_sorted) // 2]
+            # Column separators are significantly larger than within-column gaps
+            x_tolerance = max(median_gap * 2.5, 15)
+        else:
+            x_tolerance = 30
+
+    # Gap-based x-clustering
+    columns = []
+    current_col = [by_x[0]]
+    for w in by_x[1:]:
+        cx = w["left"] + w["width"] / 2
+        col_mean_x = sum(
+            (cw["left"] + cw["width"] / 2) for cw in current_col
+        ) / len(current_col)
+        if abs(cx - col_mean_x) <= x_tolerance:
+            current_col.append(w)
+        else:
+            columns.append(current_col)
+            current_col = [w]
+    columns.append(current_col)
+
+    # Sort each column internally by y-centre (top → bottom)
+    for col in columns:
+        col.sort(key=lambda w: w["top"] + w["height"] / 2)
+
+    return columns
+
+
+def _estimate_tilt_slope(columns, max_slope=0.27):
+    """
+    Estimate the tilt slope (dy / dx) of the table from detected columns.
+
+    For every pair of columns that share the same word count, words at the
+    same index are assumed to belong to the same table row.  The slope is
+    the median of  ``(y_b - y_a) / (x_b - x_a)``  over all such pairs.
+
+    Parameters
+    ----------
+    columns : list[list[dict]]
+        Columns as returned by :func:`_detect_columns`.
+    max_slope : float
+        Absolute slope cap (≈ tan 15°).  Anything larger is likely noise.
+
+    Returns
+    -------
+    float   Estimated slope (0.0 when insufficient data).
+    """
+    if len(columns) < 2:
+        return 0.0
+
+    slopes = []
+
+    for i in range(len(columns)):
+        for j in range(i + 1, len(columns)):
+            col_a, col_b = columns[i], columns[j]
+            n = min(len(col_a), len(col_b))
+            if n < 2:
+                continue
+
+            # Mean x of each column for dx
+            mean_xa = sum(w["left"] + w["width"] / 2 for w in col_a) / len(col_a)
+            mean_xb = sum(w["left"] + w["width"] / 2 for w in col_b) / len(col_b)
+            dx = mean_xb - mean_xa
+            if abs(dx) < 10:
+                continue
+
+            # Only pair when word counts are close (allow ±1 difference)
+            if abs(len(col_a) - len(col_b)) > 1:
+                continue
+
+            for k in range(n):
+                ya = col_a[k]["top"] + col_a[k]["height"] / 2
+                yb = col_b[k]["top"] + col_b[k]["height"] / 2
+                slopes.append((yb - ya) / dx)
+
+    if not slopes:
+        return 0.0
+
+    # Median is robust against outlier word pairs
+    slopes.sort()
+    median_slope = slopes[len(slopes) // 2]
+
+    # Clamp to reasonable range
+    return max(-max_slope, min(max_slope, median_slope))
+
+
+# ── Row building from word coordinates ────────────────────────────────────────
+
+
+def build_rows_from_words(words, img_height, y_tolerance=None):
+    """
+    Build table rows by combining column-aware tilt estimation with
+    y-centre clustering.  Robust against tilted scans and photos.
+
+    Algorithm
+    ---------
+    1.  Detect vertical **columns** by clustering word x-centres.
+    2.  **Estimate tilt** from corresponding words across columns
+        (same positional index → same logical row).
+    3.  Compute a **corrected y** for each word:
+        ``corrected_y = y_centre − slope × x_centre`` which removes the
+        effect of document tilt.
+    4.  **Cluster words by corrected y** (gap-based) to form rows.
+
+    Parameters
+    ----------
+    words : list[dict]
+        OCR word dicts with keys: text, left, top, width, height, conf.
+    img_height : int
+        Height of the image in pixels (used as fallback boundary).
+    y_tolerance : float or None
+        Maximum corrected-y distance for two words to be in the same
+        row.  Defaults to ``0.6 × median_word_height`` (clamped ≥ 5 px).
+
+    Returns
+    -------
+    list[dict]
+        Rows sorted top → bottom, each with keys:
+        ``y_min``, ``y_max``, ``words``, ``text``.
+    """
+    if not words:
+        return []
+
+    # ── Step 1 & 2: columns → tilt slope ──────────────────────────────
+    columns = _detect_columns(words)
+    tilt_slope = _estimate_tilt_slope(columns)
+
+    print(f"    Columns detected: {len(columns)}  "
+          f"(sizes {[len(c) for c in columns]})")
+    print(f"    Estimated tilt slope: {tilt_slope:.5f}  "
+          f"({np.degrees(np.arctan(tilt_slope)):.2f}°)")
+
+    # ── Step 3: corrected y for each word ─────────────────────────────
+    annotated = []
+    for w in words:
+        cx = w["left"] + w["width"] / 2
+        cy = w["top"] + w["height"] / 2
+        corrected_y = cy - tilt_slope * cx
+        annotated.append((corrected_y, w))
+
+    annotated.sort(key=lambda t: t[0])
+
+    # ── y-tolerance from median word height ───────────────────────────
+    if y_tolerance is None:
+        heights = sorted(w["height"] for w in words if w["height"] > 0)
+        if heights:
+            median_h = heights[len(heights) // 2]
+            y_tolerance = max(median_h * 0.6, 5)
+        else:
+            y_tolerance = 10
+
+    # ── Step 4: gap-based clustering on corrected y ───────────────────
+    clusters = []
+    current_cluster = [annotated[0]]
+    for item in annotated[1:]:
+        cy = item[0]
+        cluster_mean_y = sum(c[0] for c in current_cluster) / len(current_cluster)
+        if abs(cy - cluster_mean_y) <= y_tolerance:
+            current_cluster.append(item)
+        else:
+            clusters.append(current_cluster)
+            current_cluster = [item]
+    clusters.append(current_cluster)
+
+    # ── Convert clusters into row dicts ───────────────────────────────
     rows = []
-    for y_top, y_bot in bands:
-        row_words = []
-        for w in words:
-            word_centre_y = w["top"] + w["height"] / 2
-            if y_top <= word_centre_y < y_bot:
-                row_words.append(w)
-        # Skip empty bands (e.g. thin inter-line gaps with no text)
-        if not row_words:
-            continue
+    for cluster in clusters:
+        row_words = [item[1] for item in cluster]
         row_words.sort(key=lambda w: w["left"])
+
+        y_min = min(w["top"] for w in row_words)
+        y_max = max(w["top"] + w["height"] for w in row_words)
         text = " ".join(w["text"] for w in row_words)
+
         rows.append({
-            "y_min": y_top,
-            "y_max": y_bot,
+            "y_min": y_min,
+            "y_max": y_max,
             "words": row_words,
             "text": text,
         })
@@ -310,7 +460,7 @@ def process_page(image, search_set, padding=2):
 
     h_lines = detect_lines(normalised, "horizontal")
     words = get_ocr_words(normalised)
-    rows = build_rows_from_lines(h_lines, words, normalised.size[1])
+    rows = build_rows_from_words(words, normalised.size[1])
 
     if not rows:
         result = undo_rotation(normalised, rotation)
@@ -427,8 +577,8 @@ def main():
     parser.add_argument(
         "--padding",
         type=int,
-        default=1,
-        help="Extra padding (px) above/below redaction rectangles (default: 2)",
+        default=0,
+        help="Extra padding (px) above/below redaction rectangles (default: 0)",
     )
     parser.add_argument(
         "--dry-run",
@@ -497,7 +647,7 @@ def main():
             print(f"  Horizontal lines at y: {h_lines}")
 
             words = get_ocr_words(normalised)
-            rows = build_rows_from_lines(h_lines, words, normalised.size[1])
+            rows = build_rows_from_words(words, normalised.size[1])
 
             print(f"  Rows detected: {len(rows)}\n")
             for i, row in enumerate(rows):
