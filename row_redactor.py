@@ -215,16 +215,25 @@ def build_search_phrases(search_texts):
     treated as a full phrase (e.g. a person's full name) and kept
     intact as a tuple of normalised words.
 
+    For multi-word inputs, adjacent word concatenations are also added
+    as single-word phrases because OCR often merges names without a
+    space (e.g. "derya aytun" → "deryaaytun").
+
     Example
     -------
     >>> build_search_phrases(["Lale Bilge Deniz", "2013/8024"])
-    [('lale', 'bilge', 'deniz'), ('2013/8024',)]
+    [('lale', 'bilge', 'deniz'), ('lalebilde',), ('bilgedeniz',), ('2013/8024',)]
     """
     phrases = []
     for text in search_texts:
         words = [normalize(w) for w in text.split() if normalize(w)]
         if words:
             phrases.append(tuple(words))
+            # Add adjacent-pair concatenations for OCR merge handling
+            if len(words) >= 2:
+                for i in range(len(words) - 1):
+                    merged = words[i] + words[i + 1]
+                    phrases.append((merged,))
     return phrases
 
 
