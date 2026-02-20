@@ -1,7 +1,7 @@
 """
 Examples:
     py row_redactor.py input/input.pdf "2013/8024"
-    py row_redactor.py input/input.pdf "AHMET" "ULVIHANOGLU" -o redacted.pdf
+    py row_redactor.py input/input2.pdf "şeref aydemir" "7456710" -o redacted.pdf
 """
 
 import sys
@@ -701,7 +701,19 @@ def build_rows_from_words(words, img_height, y_tolerance=None):
         })
 
     rows.sort(key=lambda r: r["y_min"])
-    return rows
+
+    # Filter out rows with fewer than 10 total characters (likely OCR noise)
+    MIN_ROW_CHARS = 10
+    filtered_rows = []
+    for row in rows:
+        total_chars = sum(len(w["text"].strip()) for w in row["words"])
+        if total_chars >= MIN_ROW_CHARS:
+            filtered_rows.append(row)
+        else:
+            print(f"    Filtered noise row (chars={total_chars}): "
+                  f"{row['text'][:80]}")
+
+    return filtered_rows
 
 
 def _group_words_into_phrases(row_words, gap_factor=2.5):
@@ -938,14 +950,12 @@ def process_page(image, search_phrases, padding=2):
         return result, [], [], rows, h_lines, rotation
 
     # Always keep the header (first row with actual content)
-    keep_indices = {0}
+    keep_indices = set()
 
     # Score all rows and pick the single best match
     best_idx = None
     best_score = 0.0
     for i, row in enumerate(rows):
-        if i == 0:
-            continue  # header already kept
         score = _row_match_score(row, search_phrases)
         if score > best_score:
             best_score = score

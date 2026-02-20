@@ -1,3 +1,5 @@
 /input
 *.pdf
 /__pycache__/
+.env
+*.json
