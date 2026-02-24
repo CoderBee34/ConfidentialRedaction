@@ -53,7 +53,8 @@ def analyze_layout():
     with open(input_file_path, "rb") as f:
         poller = document_intelligence_client.begin_analyze_document(
             "prebuilt-layout", 
-            AnalyzeDocumentRequest(bytes_source=f.read())
+            AnalyzeDocumentRequest(bytes_source=f.read()),
+            locale="tr-TR"
         )
 
     result: AnalyzeResult = poller.result()

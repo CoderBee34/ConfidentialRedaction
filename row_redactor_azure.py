@@ -40,6 +40,7 @@ def analyze_document(input_path):
         poller = client.begin_analyze_document(
             "prebuilt-layout",
             AnalyzeDocumentRequest(bytes_source=f.read()),
+            locale="tr-TR"
         )
     return poller.result()
 
@@ -62,6 +63,35 @@ def polygon_to_bbox(polygon):
     xs = [polygon[i] for i in range(0, len(polygon), 2)]
     ys = [polygon[i] for i in range(1, len(polygon), 2)]
     return min(xs), min(ys), max(xs), max(ys)
+
+
+def _compute_scales(img_w, img_h, page_width, page_height):
+    """
+    Compute (scale_x, scale_y) accounting for possible page rotation.
+
+    Azure DI reports page dimensions in the original orientation,
+    but PyMuPDF renders the image according to the page's rotation
+    flag.  If the aspect ratios match better when swapped, the page
+    is assumed to be rotated 90°/270° and dimensions are swapped
+    before computing scales.
+
+    Returns
+    -------
+    (scale_x, scale_y) : tuple[float, float]
+        Pixels-per-inch scale factors for x and y.
+    """
+    if page_width <= 0 or page_height <= 0:
+        return 1.0, 1.0
+
+    img_ratio = img_w / img_h
+    normal_diff = abs(img_ratio - page_width / page_height)
+    swapped_diff = abs(img_ratio - page_height / page_width)
+
+    if swapped_diff < normal_diff:
+        # Page is rotated – swap dimensions
+        page_width, page_height = page_height, page_width
+
+    return img_w / page_width, img_h / page_height
 
 
 # ── Text normalisation ──────────────────────────────────────────────────────
@@ -277,15 +307,29 @@ def extract_table_rows(result, page_number):
             getattr(c, "kind", None) == "columnHeader" for c in cells
         )
 
-        # Word-level polygons (precise redaction)
+        # Word-level polygons (precise redaction) with column info
         word_polygons = []
+        word_infos = []  # richer info: polygon, column_index, font_size
         for cell in cells:
+            col_idx = cell.column_index
             if not cell.spans:
                 continue
             for word in page_words:
                 if _word_in_span(word, cell.spans):
                     if word.polygon:
                         word_polygons.append(word.polygon)
+                        x_min, y_min, x_max, y_max = polygon_to_bbox(word.polygon)
+                        bbox_w = x_max - x_min
+                        bbox_h = y_max - y_min
+                        # Font size ≈ the shorter bbox dimension
+                        # (the longer one is word length / char count).
+                        # Works regardless of text rotation.
+                        font_size = min(bbox_w, bbox_h)
+                        word_infos.append({
+                            "polygon": word.polygon,
+                            "column_index": col_idx,
+                            "font_size": font_size,
+                        })
 
         # Cell-level polygons (fallback)
         cell_polygons = []
@@ -301,6 +345,7 @@ def extract_table_rows(result, page_number):
             "cell_texts": cell_texts,
             "is_header": is_header,
             "word_polygons": word_polygons,
+            "word_infos": word_infos,
             "cell_polygons": cell_polygons,
         })
 
@@ -413,35 +458,89 @@ def row_matches_search(row, search_phrases):
 # ── Redaction ────────────────────────────────────────────────────────────────
 
 
-def redact_rows(image, rows, keep_indices, page_width, page_height, padding=2):
+def redact_rows(image, rows, keep_indices, page_width, page_height,
+                padding=2, font_size_tolerance_px=3):
     """
     Grey out words in every row whose index is NOT in *keep_indices*.
 
     Uses word-level polygons for precise redaction (preserves table grid
     lines).  Falls back to cell-level polygons when word polygons are
     unavailable.
+
+    Font-size filter
+    ----------------
+    Computes the average font size (in **pixels**) from words in columns
+    0-8 across all rows.  Font size is approximated as the shorter
+    dimension of each word's bounding box (works for any text rotation).
+    Any word whose pixel font size deviates from the average by more
+    than *font_size_tolerance_px* is **skipped** (not redacted).
+
+    Scale factors are computed with rotation awareness so that pages
+    scanned at 90°/270° are handled correctly.
     """
     draw = ImageDraw.Draw(image)
     img_w, img_h = image.size
-    scale_x = img_w / page_width
-    scale_y = img_h / page_height
+    scale_x, scale_y = _compute_scales(img_w, img_h, page_width, page_height)
+
+    # For font_size (min of bbox w/h) we need a combined scale.
+    # Use the geometric mean so it works regardless of which axis
+    # is the "short" one after rotation.
+    font_scale = (scale_x * scale_y) ** 0.5
+
+    # ── Compute average font size in PIXELS from columns 0-8 ─────────
+    target_columns = set(range(9))  # columns 0-8
+    pixel_font_sizes = []
+    for row in rows:
+        for wi in row.get("word_infos", []):
+            if wi["column_index"] in target_columns:
+                pixel_font_sizes.append(wi["font_size"] * font_scale)
+
+    avg_fs_px = (sum(pixel_font_sizes) / len(pixel_font_sizes)) if pixel_font_sizes else None
+
+    if avg_fs_px is not None:
+        print(f"  Avg font size (cols 0-8): {avg_fs_px:.1f} px  "
+              f"(tolerance ±{font_size_tolerance_px} px)")
 
     kept_rows = []
     redacted_rows = []
+    skipped_words = 0
 
     for i, row in enumerate(rows):
         if i in keep_indices:
             kept_rows.append(i)
         else:
             redacted_rows.append(i)
-            polygons = row["word_polygons"] or row["cell_polygons"]
-            for poly in polygons:
-                x_min, y_min, x_max, y_max = polygon_to_bbox(poly)
-                x0 = max(x_min * scale_x - padding, 0)
-                y0 = max(y_min * scale_y - padding, 0)
-                x1 = min(x_max * scale_x + padding, img_w)
-                y1 = min(y_max * scale_y + padding, img_h)
-                draw.rectangle([x0, y0, x1, y1], fill="grey")
+            word_infos = row.get("word_infos", [])
+
+            if word_infos:
+                for wi in word_infos:
+                    # Font-size filter: only apply to words outside cols 0-8
+                    if avg_fs_px is not None and wi["column_index"] not in target_columns:
+                        word_fs_px = wi["font_size"] * font_scale
+                        if abs(word_fs_px - avg_fs_px) > font_size_tolerance_px:
+                            skipped_words += 1
+                            continue
+
+                    poly = wi["polygon"]
+                    x_min, y_min, x_max, y_max = polygon_to_bbox(poly)
+                    x0 = max(x_min * scale_x - padding, 0)
+                    y0 = max(y_min * scale_y - padding, 0)
+                    x1 = min(x_max * scale_x + padding, img_w)
+                    y1 = min(y_max * scale_y + padding, img_h)
+                    draw.rectangle([x0, y0, x1, y1], fill="grey")
+            else:
+                # Fallback: no word_infos, use raw polygons
+                polygons = row["word_polygons"] or row["cell_polygons"]
+                for poly in polygons:
+                    x_min, y_min, x_max, y_max = polygon_to_bbox(poly)
+                    x0 = max(x_min * scale_x - padding, 0)
+                    y0 = max(y_min * scale_y - padding, 0)
+                    x1 = min(x_max * scale_x + padding, img_w)
+                    y1 = min(y_max * scale_y + padding, img_h)
+                    draw.rectangle([x0, y0, x1, y1], fill="grey")
+
+    if skipped_words:
+        print(f"  Font-size filter: skipped {skipped_words} word(s)")
 
     return image, kept_rows, redacted_rows
 
@@ -506,7 +605,8 @@ def _process_with_result(input_path, output_path, search_texts, result,
             print(f"  Best matching row: {best_idx} (score {best_score:.3f})")
 
         redacted_img, kept_rows, redacted_rows_list = redact_rows(
-            image, rows, keep_indices, page_width, page_height, padding=padding,
+            image, rows, keep_indices, page_width, page_height,
+            padding=padding,
         )
 
         print(f"  Kept rows ({len(kept_rows)}):")
