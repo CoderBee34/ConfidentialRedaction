@@ -15,8 +15,8 @@ import re
 import argparse
 
 import fitz
-from PIL import Image, ImageDraw
 from dotenv import load_dotenv
+from rapidfuzz.distance import Levenshtein
 
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
@@ -26,6 +26,9 @@ load_dotenv()
 
 ENDPOINT = os.getenv("DOCUMENT_INTELLIGENCE_ENDPOINT")
 KEY = os.getenv("DOCUMENT_INTELLIGENCE_KEY")
+
+# Azure DI coordinates are in inches; PDF uses 72 points per inch.
+_INCH_TO_PT = 72.0
 
 
 # ── Azure Document Intelligence ──────────────────────────────────────────────
@@ -45,16 +48,6 @@ def analyze_document(input_path):
     return poller.result()
 
 
-# ── PDF page rendering ──────────────────────────────────────────────────────
-
-
-def pdf_page_to_image(page, dpi=300):
-    """Convert a PyMuPDF page to a PIL Image at the specified DPI."""
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    pix = page.get_pixmap(matrix=mat)
-    return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-
-
 # ── Coordinate helpers ───────────────────────────────────────────────────────
 
 
@@ -65,33 +58,6 @@ def polygon_to_bbox(polygon):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def _compute_scales(img_w, img_h, page_width, page_height):
-    """
-    Compute (scale_x, scale_y) accounting for possible page rotation.
-
-    Azure DI reports page dimensions in the original orientation,
-    but PyMuPDF renders the image according to the page's rotation
-    flag.  If the aspect ratios match better when swapped, the page
-    is assumed to be rotated 90°/270° and dimensions are swapped
-    before computing scales.
-
-    Returns
-    -------
-    (scale_x, scale_y) : tuple[float, float]
-        Pixels-per-inch scale factors for x and y.
-    """
-    if page_width <= 0 or page_height <= 0:
-        return 1.0, 1.0
-
-    img_ratio = img_w / img_h
-    normal_diff = abs(img_ratio - page_width / page_height)
-    swapped_diff = abs(img_ratio - page_height / page_width)
-
-    if swapped_diff < normal_diff:
-        # Page is rotated – swap dimensions
-        page_width, page_height = page_height, page_width
-
-    return img_w / page_width, img_h / page_height
 
 
 # ── Text normalisation ──────────────────────────────────────────────────────
@@ -107,57 +73,32 @@ def normalize(text):
 
 # ── Fuzzy matching helpers ───────────────────────────────────────────────────
 
-# Common OCR / character confusion pairs
-_OCR_CONFUSIONS = {
-    '0': 'o', 'o': '0',
-    '1': 'l', 'l': '1',
-    'i': 'ı', 'ı': 'i',
-    '5': 's', 's': '5',
-    '8': 'b', 'b': '8',
-    'ğ': 'g', 'g': 'ğ',
-    'ü': 'u', 'u': 'ü',
-    'ö': 'o',
-    'ş': 's',
-    'ç': 'c', 'c': 'ç',
-    'â': 'a',
-    'î': 'i',
-    'û': 'u',
+# Map each OCR-confusable character to a single canonical form so that
+# confusable pairs collapse *before* the Levenshtein check.
+_OCR_CANONICAL = {
+    '0': 'o', 'ö': 'o',          # o / 0 / ö  →  o
+    '1': 'l',                     # l / 1       →  l
+    'ı': 'i', 'î': 'i',          # i / ı / î   →  i
+    '5': 's', 'ş': 's',          # s / 5 / ş   →  s
+    '8': 'b',                     # b / 8       →  b
+    'ğ': 'g',                     # g / ğ       →  g
+    'ü': 'u', 'û': 'u',          # u / ü / û   →  u
+    'ç': 'c',                     # c / ç       →  c
+    'â': 'a',                     # a / â       →  a
 }
 
 
-def _char_match(a, b):
-    """Return True if characters *a* and *b* are identical or confusable."""
-    if a == b:
-        return True
-    return _OCR_CONFUSIONS.get(a) == b or _OCR_CONFUSIONS.get(b) == a
-
-
-def _edit_distance(s1, s2, max_dist=None):
-    """Edit distance with confusion-aware substitution (cost 0)."""
-    len1, len2 = len(s1), len(s2)
-    if max_dist is not None and abs(len1 - len2) > max_dist:
-        return max_dist + 1
-    prev = list(range(len2 + 1))
-    for i in range(1, len1 + 1):
-        curr = [i] + [0] * len2
-        row_min = i
-        for j in range(1, len2 + 1):
-            cost = 0 if _char_match(s1[i - 1], s2[j - 1]) else 1
-            curr[j] = min(
-                curr[j - 1] + 1,       # insertion
-                prev[j] + 1,            # deletion
-                prev[j - 1] + cost,     # substitution
-            )
-            row_min = min(row_min, curr[j])
-        if max_dist is not None and row_min > max_dist:
-            return max_dist + 1
-        prev = curr
-    return prev[len2]
+def _ocr_normalize(text):
+    """Replace OCR-confusable characters with their canonical form."""
+    return "".join(_OCR_CANONICAL.get(ch, ch) for ch in text)
 
 
 def _fuzzy_word_match(search_word, target_word, threshold=None):
     """
     Return True if *search_word* fuzzy-matches *target_word*.
+
+    OCR-confusable characters are canonicalised before comparison.
+    Uses rapidfuzz (C-extension) for the Levenshtein distance.
 
     Allowed edit distance scales with word length:
       len <= 3 -> 0,  4-6 -> 1,  7-10 -> 2,  >10 -> 3
@@ -166,8 +107,14 @@ def _fuzzy_word_match(search_word, target_word, threshold=None):
         return True
     if search_word in target_word or target_word in search_word:
         return True
+
+    s_norm = _ocr_normalize(search_word)
+    t_norm = _ocr_normalize(target_word)
+    if s_norm == t_norm:
+        return True
+
     if threshold is None:
-        max_len = max(len(search_word), len(target_word))
+        max_len = max(len(s_norm), len(t_norm))
         if max_len <= 3:
             threshold = 0
         elif max_len <= 6:
@@ -176,7 +123,8 @@ def _fuzzy_word_match(search_word, target_word, threshold=None):
             threshold = 2
         else:
             threshold = 3
-    dist = _edit_distance(search_word, target_word, max_dist=threshold)
+
+    dist = Levenshtein.distance(s_norm, t_norm, score_cutoff=threshold)
     return dist <= threshold
 
 
@@ -356,7 +304,10 @@ def extract_table_rows(result, page_number):
 
 
 def _word_match_score(search_word, target_word):
-    """Return a match score 0.0-1.0 for a single word pair."""
+    """Return a match score 0.0-1.0 for a single word pair.
+
+    Uses OCR-canonical normalisation + rapidfuzz Levenshtein.
+    """
     if search_word == target_word:
         return 1.0
     if search_word in target_word or target_word in search_word:
@@ -364,7 +315,12 @@ def _word_match_score(search_word, target_word):
         longer = max(len(search_word), len(target_word))
         return 0.85 * (shorter / longer)
 
-    max_len = max(len(search_word), len(target_word))
+    s_norm = _ocr_normalize(search_word)
+    t_norm = _ocr_normalize(target_word)
+    if s_norm == t_norm:
+        return 1.0
+
+    max_len = max(len(s_norm), len(t_norm))
     if max_len <= 3:
         threshold = 0
     elif max_len <= 6:
@@ -374,7 +330,7 @@ def _word_match_score(search_word, target_word):
     else:
         threshold = 3
 
-    dist = _edit_distance(search_word, target_word, max_dist=threshold)
+    dist = Levenshtein.distance(s_norm, t_norm, score_cutoff=threshold)
     if dist > threshold:
         return 0.0
     return max(0.0, 1.0 - dist / max(max_len, 1))
@@ -458,52 +414,48 @@ def row_matches_search(row, search_phrases):
 # ── Redaction ────────────────────────────────────────────────────────────────
 
 
-def redact_rows(image, rows, keep_indices, page_width, page_height,
-                padding=2, font_size_tolerance_px=3):
+def redact_rows(page, rows, keep_indices,
+                padding_pt=1, font_size_tolerance_pt=1.0):
     """
-    Grey out words in every row whose index is NOT in *keep_indices*.
+    Draw grey rectangles directly on a PyMuPDF *page* over words in
+    rows whose index is NOT in *keep_indices*.
 
-    Uses word-level polygons for precise redaction (preserves table grid
-    lines).  Falls back to cell-level polygons when word polygons are
-    unavailable.
+    Coordinate conversion
+    ---------------------
+    Azure DI coordinates are in **inches**.  We convert to PDF points
+    (× 72) to get visual-space coordinates, then apply the page’s
+    ``derotation_matrix`` to map into the internal CropBox coordinate
+    system used by PyMuPDF’s drawing operations.  This correctly
+    handles pages with any ``/Rotate`` value (0, 90, 180, 270).
 
     Font-size filter
     ----------------
-    Computes the average font size (in **pixels**) from words in columns
-    0-8 across all rows.  Font size is approximated as the shorter
-    dimension of each word's bounding box (works for any text rotation).
-    Any word whose pixel font size deviates from the average by more
-    than *font_size_tolerance_px* is **skipped** (not redacted).
-
-    Scale factors are computed with rotation awareness so that pages
-    scanned at 90°/270° are handled correctly.
+    Computes the average font size (in **points**) from words in columns
+    0-8 across all rows.  Words outside columns 0-8 whose font size
+    deviates from the average by more than *font_size_tolerance_pt* are
+    **skipped** (not redacted).
     """
-    draw = ImageDraw.Draw(image)
-    img_w, img_h = image.size
-    scale_x, scale_y = _compute_scales(img_w, img_h, page_width, page_height)
+    derotation = page.derotation_matrix
+    clip_rect = page.cropbox
 
-    # For font_size (min of bbox w/h) we need a combined scale.
-    # Use the geometric mean so it works regardless of which axis
-    # is the "short" one after rotation.
-    font_scale = (scale_x * scale_y) ** 0.5
-
-    # ── Compute average font size in PIXELS from columns 0-8 ─────────
+    # ── Compute average font size in POINTS from columns 0-8 ─────────
     target_columns = set(range(9))  # columns 0-8
-    pixel_font_sizes = []
+    font_sizes_pt = []
     for row in rows:
         for wi in row.get("word_infos", []):
             if wi["column_index"] in target_columns:
-                pixel_font_sizes.append(wi["font_size"] * font_scale)
+                font_sizes_pt.append(wi["font_size"] * _INCH_TO_PT)
 
-    avg_fs_px = (sum(pixel_font_sizes) / len(pixel_font_sizes)) if pixel_font_sizes else None
+    avg_fs_pt = (sum(font_sizes_pt) / len(font_sizes_pt)) if font_sizes_pt else None
 
-    if avg_fs_px is not None:
-        print(f"  Avg font size (cols 0-8): {avg_fs_px:.1f} px  "
-              f"(tolerance ±{font_size_tolerance_px} px)")
+    if avg_fs_pt is not None:
+        print(f"  Avg font size (cols 0-8): {avg_fs_pt:.2f} pt  "
+              f"(tolerance ±{font_size_tolerance_pt} pt)")
 
     kept_rows = []
     redacted_rows = []
     skipped_words = 0
+    grey = (0.5, 0.5, 0.5)  # RGB 0–1
 
     for i, row in enumerate(rows):
         if i in keep_indices:
@@ -515,73 +467,67 @@ def redact_rows(image, rows, keep_indices, page_width, page_height,
             if word_infos:
                 for wi in word_infos:
                     # Font-size filter: only apply to words outside cols 0-8
-                    if avg_fs_px is not None and wi["column_index"] not in target_columns:
-                        word_fs_px = wi["font_size"] * font_scale
-                        if abs(word_fs_px - avg_fs_px) > font_size_tolerance_px:
+                    if avg_fs_pt is not None and wi["column_index"] not in target_columns:
+                        word_fs_pt = wi["font_size"] * _INCH_TO_PT
+                        if abs(word_fs_pt - avg_fs_pt) > font_size_tolerance_pt:
                             skipped_words += 1
                             continue
 
                     poly = wi["polygon"]
                     x_min, y_min, x_max, y_max = polygon_to_bbox(poly)
-                    x0 = max(x_min * scale_x - padding, 0)
-                    y0 = max(y_min * scale_y - padding, 0)
-                    x1 = min(x_max * scale_x + padding, img_w)
-                    y1 = min(y_max * scale_y + padding, img_h)
-                    draw.rectangle([x0, y0, x1, y1], fill="grey")
+                    # Azure inches → visual points → CropBox coords
+                    visual_rect = fitz.Rect(
+                        x_min * _INCH_TO_PT - padding_pt,
+                        y_min * _INCH_TO_PT - padding_pt,
+                        x_max * _INCH_TO_PT + padding_pt,
+                        y_max * _INCH_TO_PT + padding_pt,
+                    )
+                    draw_rect = (visual_rect * derotation) & clip_rect
+                    page.add_redact_annot(draw_rect, fill=grey)
             else:
                 # Fallback: no word_infos, use raw polygons
                 polygons = row["word_polygons"] or row["cell_polygons"]
                 for poly in polygons:
                     x_min, y_min, x_max, y_max = polygon_to_bbox(poly)
-                    x0 = max(x_min * scale_x - padding, 0)
-                    y0 = max(y_min * scale_y - padding, 0)
-                    x1 = min(x_max * scale_x + padding, img_w)
-                    y1 = min(y_max * scale_y + padding, img_h)
-                    draw.rectangle([x0, y0, x1, y1], fill="grey")
+                    visual_rect = fitz.Rect(
+                        x_min * _INCH_TO_PT - padding_pt,
+                        y_min * _INCH_TO_PT - padding_pt,
+                        x_max * _INCH_TO_PT + padding_pt,
+                        y_max * _INCH_TO_PT + padding_pt,
+                    )
+                    draw_rect = (visual_rect * derotation) & clip_rect
+                    page.add_redact_annot(draw_rect, fill=grey)
 
     if skipped_words:
         print(f"  Font-size filter: skipped {skipped_words} word(s)")
 
-    return image, kept_rows, redacted_rows
+    return kept_rows, redacted_rows
 
 
 # ── Processing pipeline ─────────────────────────────────────────────────────
 
-
-def process_pdf(input_path, output_path, search_texts, dpi=200, padding=2):
-    """Main pipeline: analyse with Azure DI, match rows, redact, save."""
-    search_phrases = build_search_phrases(search_texts)
-    print(f"Search phrases (normalized): {search_phrases}\n")
-
-    print("Analyzing document with Azure Document Intelligence...")
-    result = analyze_document(input_path)
-    print("Analysis complete.\n")
-
-    _process_with_result(input_path, output_path, search_texts, result,
-                         dpi=dpi, padding=padding)
-
-
 def _process_with_result(input_path, output_path, search_texts, result,
-                         dpi=200, padding=2):
-    """Run the redaction pipeline with a pre-obtained Azure DI result."""
+                         padding_pt=1):
+    """Run the redaction pipeline with a pre-obtained Azure DI result.
+
+    Draws grey rectangles directly on the vector PDF pages — no
+    rasterisation, preserves selectable text, tiny file sizes.
+    """
     search_phrases = build_search_phrases(search_texts)
 
     doc = fitz.open(input_path)
-    redacted_images = []
 
     for page_num in range(len(doc)):
         page_number = page_num + 1
         print(f"--- Page {page_number}/{len(doc)} ---")
 
         page = doc[page_num]
-        image = pdf_page_to_image(page, dpi=dpi)
-        print(f"  Image size: {image.size[0]}x{image.size[1]} px")
+        print(f"  Page size: {page.rect.width:.0f}×{page.rect.height:.0f} pt")
 
         rows, page_width, page_height = extract_table_rows(result, page_number)
 
         if not rows:
             print("  No table rows found on this page.")
-            redacted_images.append(image)
             continue
 
         print(f"  Table rows detected: {len(rows)}")
@@ -604,31 +550,21 @@ def _process_with_result(input_path, output_path, search_texts, result,
             keep_indices.add(best_idx)
             print(f"  Best matching row: {best_idx} (score {best_score:.3f})")
 
-        redacted_img, kept_rows, redacted_rows_list = redact_rows(
-            image, rows, keep_indices, page_width, page_height,
-            padding=padding,
+        kept_rows, redacted_rows_list = redact_rows(
+            page, rows, keep_indices,
+            padding_pt=padding_pt,
         )
 
         print(f"  Kept rows ({len(kept_rows)}):")
         for ki in kept_rows:
             print(f"    Row {ki}: {rows[ki]['text'][:120]}")
         print(f"  Redacted rows: {len(redacted_rows_list)}")
-
-        redacted_images.append(redacted_img)
-
+    
+    for page in doc:
+        page.apply_redactions()
+    doc.save(output_path, garbage=4, deflate=True)
     doc.close()
-
-    if redacted_images:
-        redacted_images[0].save(
-            output_path,
-            "PDF",
-            save_all=True,
-            append_images=redacted_images[1:] if len(redacted_images) > 1 else [],
-            resolution=dpi,
-        )
-        print(f"\nRedacted PDF saved to: {output_path}")
-    else:
-        print("No pages found in the PDF.")
+    print(f"\nRedacted PDF saved to: {output_path}")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -646,8 +582,6 @@ def main():
             "Examples:\n"
             '  py row_redactor_azure.py input/input.pdf "2013/8024"\n'
             '  py row_redactor_azure.py input/input.pdf "AHMET" "ULVIHANOGLU"\n'
-            '  py row_redactor_azure.py input/input.pdf --keep-file rows.txt -o out.pdf\n'
-            '  py row_redactor_azure.py input/input.pdf "2014/9870" --dry-run\n'
         ),
     )
     parser.add_argument("input_pdf", help="Path to the input PDF file")
@@ -667,26 +601,10 @@ def main():
         help="Output PDF path (default: <input>_redacted.pdf)",
     )
     parser.add_argument(
-        "--keep-file",
-        default=None,
-        help="Path to a text file with search values (one per line)",
-    )
-    parser.add_argument(
-        "--dpi",
-        type=int,
-        default=200,
-        help="DPI for rendering PDF pages as images (default: 200)",
-    )
-    parser.add_argument(
         "--padding",
-        type=int,
+        type=float,
         default=0,
-        help="Extra padding (px) around redaction rectangles (default: 0)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show detected rows and keep/redact decisions without saving",
+        help="Extra padding in points around redaction rectangles (default: 1)",
     )
 
     args = parser.parse_args()
@@ -703,16 +621,7 @@ def main():
 
     # ── Collect search values ─────────────────────────────────────────
     search_texts = list(args.search_values)
-    if args.keep_file:
-        if not os.path.exists(args.keep_file):
-            print(f"Error: Keep file '{args.keep_file}' not found.")
-            sys.exit(1)
-        with open(args.keep_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    search_texts.append(line)
-
+    
     if not search_texts:
         print("Error: No search values specified. "
               "Provide them as arguments or via --keep-file.")
@@ -730,12 +639,9 @@ def main():
     print("=" * 60)
     print(f"  Input:      {args.input_pdf}")
     print(f"  Output:     {args.output}")
-    print(f"  DPI:        {args.dpi}")
-    print(f"  Padding:    {args.padding}px")
+    print(f"  Padding:    {args.padding} pt")
     print(f"  Search for: {search_texts}")
     print(f"  Phrases:    {search_phrases}")
-    if args.dry_run:
-        print("  Mode:       DRY RUN (no output will be saved)")
     print("=" * 60)
     print()
 
@@ -744,60 +650,15 @@ def main():
     result = analyze_document(args.input_pdf)
     print("Analysis complete.\n")
 
-    # ── Dry run ───────────────────────────────────────────────────────
-    if args.dry_run:
-        doc = fitz.open(args.input_pdf)
-        for page_num in range(len(doc)):
-            page_number = page_num + 1
-            print(f"--- Page {page_number}/{len(doc)} ---")
-
-            rows, page_width, page_height = extract_table_rows(
-                result, page_number)
-
-            if not rows:
-                print("  No table rows found on this page.\n")
-                continue
-
-            print(f"  Rows detected: {len(rows)}\n")
-
-            best_idx = None
-            best_score = 0.0
-            for i, row in enumerate(rows):
-                if row["is_header"]:
-                    continue
-                score = _row_match_score(row, search_phrases)
-                if score > best_score:
-                    best_score = score
-                    best_idx = i
-
-            for i, row in enumerate(rows):
-                if row["is_header"]:
-                    status = "HEADER (keep)"
-                elif i == best_idx:
-                    status = "BEST   (keep)"
-                else:
-                    score = _row_match_score(row, search_phrases)
-                    status = f"match  s={score:.2f}" if score > 0 else "REDACT"
-
-                print(f"  Row {i:3d} [{status:14s}]  {row['text'][:100]}")
-
-            if best_idx is not None:
-                print(f"\n  -> Best match: Row {best_idx} "
-                      f"(score {best_score:.3f})")
-        doc.close()
-        print("\nDry run complete. No file was saved.")
-
     # ── Actual redaction ──────────────────────────────────────────────
-    else:
-        out_dir = os.path.dirname(args.output)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
+    out_dir = os.path.dirname(args.output)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
-        _process_with_result(
-            args.input_pdf, args.output, search_texts, result,
-            dpi=args.dpi, padding=args.padding,
-        )
-
+    _process_with_result(
+        args.input_pdf, args.output, search_texts, result,
+        padding_pt=args.padding,
+    )
 
 if __name__ == "__main__":
     main()
