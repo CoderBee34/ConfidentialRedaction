@@ -1,12 +1,15 @@
 """
 PDF Table Row Redaction Tool using Azure Document Intelligence.
 
-Analyzes PDF tables with Azure DI, finds the row matching search values,
-and redacts (greys out) all other rows.  The header row is always kept.
+Analyzes PDF tables with Azure DI, finds the rows matching search values,
+and redacts (greys out) all other rows.  Header rows are always kept.
+Rows with scores close to the best match are also kept (controlled by
+``--score-tolerance``).
 
 Examples:
     py row_redactor_azure.py input/input.pdf "2013/8024"
     py row_redactor_azure.py input/input2.pdf "şeref aydemir" "7456710" -o redacted.pdf
+    py row_redactor_azure.py input/input.pdf "AHMET" --score-tolerance 0.15
 """
 
 import sys
@@ -352,6 +355,52 @@ def _row_match_score(row, search_phrases):
 
     return total if matched_any else 0.0
 
+
+def find_matching_rows(rows, search_phrases, score_tolerance=0.05):
+    """
+    Score every non-header row and return the indices to keep.
+
+    All rows whose score is within *score_tolerance* (fraction) of
+    the best score are kept.  For example, with tolerance=0.10 and
+    best_score=3.0, every row scoring >= 2.7 is kept.
+
+    Parameters
+    ----------
+    rows : list[dict]
+        Row dicts as returned by :func:`extract_table_rows`.
+    search_phrases : list[tuple[str, ...]]
+        Normalised search phrases from :func:`build_search_phrases`.
+    score_tolerance : float
+        Fraction (0.0–1.0).  0.0 keeps only the exact best; 1.0
+        keeps every row that scored > 0.
+
+    Returns
+    -------
+    (keep_indices, scored_rows)
+        *keep_indices* is a set of row indices to keep.
+        *scored_rows* is a list of ``(row_index, score)`` sorted
+        descending by score (excludes header rows).
+    """
+    scored_rows = []
+    for i, row in enumerate(rows):
+        if row["is_header"]:
+            continue
+        score = _row_match_score(row, search_phrases)
+        scored_rows.append((i, score))
+
+    # Sort descending by score
+    scored_rows.sort(key=lambda x: x[1], reverse=True)
+
+    if not scored_rows or scored_rows[0][1] <= 0:
+        return set(), scored_rows
+
+    best_score = scored_rows[0][1]
+    threshold = best_score * (1.0 - score_tolerance)
+
+    keep_indices = {i for i, score in scored_rows if score >= threshold and score > 0}
+    return keep_indices, scored_rows
+
+
 # ── Redaction ────────────────────────────────────────────────────────────────
 
 
@@ -448,11 +497,14 @@ def redact_rows(page, rows, keep_indices,
 # ── Processing pipeline ─────────────────────────────────────────────────────
 
 def _process_with_result(input_path, output_path, search_texts, result,
-                         padding_pt=0):
+                         padding_pt=0, score_tolerance=0.10):
     """Run the redaction pipeline with a pre-obtained Azure DI result.
 
     Draws grey rectangles directly on the vector PDF pages — no
     rasterisation, preserves selectable text, tiny file sizes.
+
+    Rows whose match score is within *score_tolerance* of the best
+    score are all kept (not redacted).
     """
     search_phrases = build_search_phrases(search_texts)
 
@@ -476,30 +528,30 @@ def _process_with_result(input_path, output_path, search_texts, result,
         # Keep all header rows (columnHeader kind)
         keep_indices = {i for i, row in enumerate(rows) if row["is_header"]}
 
-        # Score non-header rows and pick the single best match
-        best_idx = None
-        best_score = 0.0
-        for i, row in enumerate(rows):
-            if row["is_header"]:
-                continue
-            score = _row_match_score(row, search_phrases)
-            if score > best_score:
-                best_score = score
-                best_idx = i
+        # Score non-header rows; keep all within tolerance of the best
+        match_indices, scored_rows = find_matching_rows(
+            rows, search_phrases, score_tolerance=score_tolerance,
+        )
+        keep_indices |= match_indices
 
-        if best_idx is not None:
-            keep_indices.add(best_idx)
-            print(f"  Best matching row: {best_idx} (score {best_score:.3f})")
+        # Print scoring summary
+        if scored_rows:
+            best_score = scored_rows[0][1]
+            threshold = best_score * (1.0 - score_tolerance) if best_score > 0 else 0
+            print(f"  Best score: {best_score:.3f}  "
+                  f"(tolerance {score_tolerance:.0%}, "
+                  f"keep threshold >= {threshold:.3f})")
+            for idx, score in scored_rows:
+                kept_flag = "KEEP" if idx in keep_indices else "    "
+                preview = rows[idx]['text'][:90]
+                print(f"    [{kept_flag}] Row {idx}: score {score:.3f}  {preview}")
 
         kept_rows, redacted_rows_list = redact_rows(
             page, rows, keep_indices,
             padding_pt=padding_pt,
         )
 
-        print(f"  Kept rows ({len(kept_rows)}):")
-        for ki in kept_rows:
-            print(f"    Row {ki}: {rows[ki]['text'][:120]}")
-        print(f"  Redacted rows: {len(redacted_rows_list)}")
+        print(f"  Kept rows ({len(kept_rows)})  |  Redacted rows: {len(redacted_rows_list)}")
     
     for page in doc:
         page.apply_redactions()
@@ -545,7 +597,18 @@ def main():
         "--padding",
         type=float,
         default=0,
-        help="Extra padding in points around redaction rectangles (default: 1)",
+        help="Extra padding in points around redaction rectangles (default: 0)",
+    )
+    parser.add_argument(
+        "--score-tolerance",
+        type=float,
+        default=0.05,
+        help=(
+            "Fraction (0.0-1.0) of the best row score used as a proximity "
+            "band.  Rows scoring within this fraction of the best score "
+            "are also kept un-redacted.  0.0 = only the single best row; "
+            "1.0 = every row that scored > 0.  (default: 0.10)"
+        ),
     )
 
     args = parser.parse_args()
@@ -578,11 +641,12 @@ def main():
     print("=" * 60)
     print("PDF Table Row Redaction Tool  (Azure Document Intelligence)")
     print("=" * 60)
-    print(f"  Input:      {args.input_pdf}")
-    print(f"  Output:     {args.output}")
-    print(f"  Padding:    {args.padding} pt")
-    print(f"  Search for: {search_texts}")
-    print(f"  Phrases:    {search_phrases}")
+    print(f"  Input:           {args.input_pdf}")
+    print(f"  Output:          {args.output}")
+    print(f"  Padding:         {args.padding} pt")
+    print(f"  Score tolerance: {args.score_tolerance:.0%}")
+    print(f"  Search for:      {search_texts}")
+    print(f"  Phrases:         {search_phrases}")
     print("=" * 60)
     print()
 
@@ -599,6 +663,7 @@ def main():
     _process_with_result(
         args.input_pdf, args.output, search_texts, result,
         padding_pt=args.padding,
+        score_tolerance=args.score_tolerance,
     )
 
 if __name__ == "__main__":
