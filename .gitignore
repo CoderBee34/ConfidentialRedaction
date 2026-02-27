@@ -4,3 +4,4 @@
 .env
 *.json
 helper.py
+encode_pdf.py

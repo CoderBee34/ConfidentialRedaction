@@ -42,7 +42,7 @@ CALLBACK_URL = os.getenv("CALLBACK_URL")
 _INCH_TO_PT = 72.0
 MAX_FILE_SIZE = 20 * 1024 * 1024
 SCORE_TOLERANCE = 0.05
-PADDING_PT = 1.0
+PADDING_PT = 0
 
 # Testing: save redacted PDFs to this directory (set to empty string to disable)
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
@@ -486,10 +486,16 @@ async def process_and_send_webhook(
     logger.info(f"Job {job_id} started. Processing {filename}.")
     
     try:
-        # 1. Call Azure (Async Call)
+        # Validate PDF header
+        if not pdf_bytes.startswith(b'%PDF'):
+            raise ValueError(f"Invalid PDF: missing %PDF header (starts with {pdf_bytes[:20]!r})")
+        
+        logger.info(f"Job {job_id}: PDF size={len(pdf_bytes)} bytes, header valid")
+        
+        # 1. Call Azure (Async Call) - matching row_redactor_azure.py format
         poller = await azure_client.begin_analyze_document(
             "prebuilt-layout",
-            AnalyzeDocumentRequest(bytes_source=pdf_bytes),
+            AnalyzeDocumentRequest(bytes_source=bytes(pdf_bytes)),
             locale="tr-TR"
         )
         result = await poller.result()
@@ -562,6 +568,13 @@ async def redact_pdf(
 
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="doc_content is empty")
+
+    # Validate PDF header
+    if not pdf_bytes.startswith(b'%PDF'):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid PDF: missing %PDF header (got: {pdf_bytes[:20]!r})"
+        )
 
     if len(pdf_bytes) > MAX_FILE_SIZE:
         raise HTTPException(
