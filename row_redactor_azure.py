@@ -2,7 +2,7 @@
 PDF Table Row Redaction Tool using Azure Document Intelligence.
 
 Analyzes PDF tables with Azure DI, finds the row matching search values,
-and redacts (greys out) all other rows.  The header row (row 0) is always kept.
+and redacts (greys out) all other rows.  The header row is always kept.
 
 Examples:
     py row_redactor_azure.py input/input.pdf "2013/8024"
@@ -33,7 +33,6 @@ _INCH_TO_PT = 72.0
 
 # ── Azure Document Intelligence ──────────────────────────────────────────────
 
-
 def analyze_document(input_path):
     """Analyze a PDF with Azure Document Intelligence (prebuilt-layout)."""
     client = DocumentIntelligenceClient(
@@ -58,8 +57,6 @@ def polygon_to_bbox(polygon):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-
-
 # ── Text normalisation ──────────────────────────────────────────────────────
 
 
@@ -73,31 +70,10 @@ def normalize(text):
 
 # ── Fuzzy matching helpers ───────────────────────────────────────────────────
 
-# Map each OCR-confusable character to a single canonical form so that
-# confusable pairs collapse *before* the Levenshtein check.
-_OCR_CANONICAL = {
-    '0': 'o', 'ö': 'o',          # o / 0 / ö  →  o
-    '1': 'l',                     # l / 1       →  l
-    'ı': 'i', 'î': 'i',          # i / ı / î   →  i
-    '5': 's', 'ş': 's',          # s / 5 / ş   →  s
-    '8': 'b',                     # b / 8       →  b
-    'ğ': 'g',                     # g / ğ       →  g
-    'ü': 'u', 'û': 'u',          # u / ü / û   →  u
-    'ç': 'c',                     # c / ç       →  c
-    'â': 'a',                     # a / â       →  a
-}
-
-
-def _ocr_normalize(text):
-    """Replace OCR-confusable characters with their canonical form."""
-    return "".join(_OCR_CANONICAL.get(ch, ch) for ch in text)
-
-
 def _fuzzy_word_match(search_word, target_word, threshold=None):
     """
     Return True if *search_word* fuzzy-matches *target_word*.
 
-    OCR-confusable characters are canonicalised before comparison.
     Uses rapidfuzz (C-extension) for the Levenshtein distance.
 
     Allowed edit distance scales with word length:
@@ -108,13 +84,8 @@ def _fuzzy_word_match(search_word, target_word, threshold=None):
     if search_word in target_word or target_word in search_word:
         return True
 
-    s_norm = _ocr_normalize(search_word)
-    t_norm = _ocr_normalize(target_word)
-    if s_norm == t_norm:
-        return True
-
     if threshold is None:
-        max_len = max(len(s_norm), len(t_norm))
+        max_len = max(len(search_word), len(target_word))
         if max_len <= 3:
             threshold = 0
         elif max_len <= 6:
@@ -124,7 +95,7 @@ def _fuzzy_word_match(search_word, target_word, threshold=None):
         else:
             threshold = 3
 
-    dist = Levenshtein.distance(s_norm, t_norm, score_cutoff=threshold)
+    dist = Levenshtein.distance(search_word, target_word, score_cutoff=threshold)
     return dist <= threshold
 
 
@@ -306,7 +277,7 @@ def extract_table_rows(result, page_number):
 def _word_match_score(search_word, target_word):
     """Return a match score 0.0-1.0 for a single word pair.
 
-    Uses OCR-canonical normalisation + rapidfuzz Levenshtein.
+    Uses rapidfuzz Levenshtein.
     """
     if search_word == target_word:
         return 1.0
@@ -315,12 +286,7 @@ def _word_match_score(search_word, target_word):
         longer = max(len(search_word), len(target_word))
         return 0.85 * (shorter / longer)
 
-    s_norm = _ocr_normalize(search_word)
-    t_norm = _ocr_normalize(target_word)
-    if s_norm == t_norm:
-        return 1.0
-
-    max_len = max(len(s_norm), len(t_norm))
+    max_len = max(len(search_word), len(target_word))
     if max_len <= 3:
         threshold = 0
     elif max_len <= 6:
@@ -330,7 +296,7 @@ def _word_match_score(search_word, target_word):
     else:
         threshold = 3
 
-    dist = Levenshtein.distance(s_norm, t_norm, score_cutoff=threshold)
+    dist = Levenshtein.distance(search_word, target_word, score_cutoff=threshold)
     if dist > threshold:
         return 0.0
     return max(0.0, 1.0 - dist / max(max_len, 1))
@@ -385,31 +351,6 @@ def _row_match_score(row, search_phrases):
         total += best_phrase_score
 
     return total if matched_any else 0.0
-
-
-def row_matches_search(row, search_phrases):
-    """Return True if ANY search phrase fuzzy-matches within the row."""
-    if not search_phrases:
-        return False
-
-    row_grouped = []
-    for cell_text in row["cell_texts"]:
-        norm_words = tuple(normalize(w) for w in cell_text.split() if normalize(w))
-        if norm_words:
-            row_grouped.append(norm_words)
-
-    all_row_words = tuple(w for group in row_grouped for w in group)
-
-    for search_phrase in search_phrases:
-        if len(search_phrase) == 1:
-            if any(_fuzzy_word_match(search_phrase[0], rw) for rw in all_row_words):
-                return True
-        else:
-            for grouped in row_grouped:
-                if _phrase_fuzzy_match(search_phrase, grouped):
-                    return True
-    return False
-
 
 # ── Redaction ────────────────────────────────────────────────────────────────
 
@@ -507,7 +448,7 @@ def redact_rows(page, rows, keep_indices,
 # ── Processing pipeline ─────────────────────────────────────────────────────
 
 def _process_with_result(input_path, output_path, search_texts, result,
-                         padding_pt=1):
+                         padding_pt=0):
     """Run the redaction pipeline with a pre-obtained Azure DI result.
 
     Draws grey rectangles directly on the vector PDF pages — no
