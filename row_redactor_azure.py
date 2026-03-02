@@ -602,7 +602,7 @@ def main():
     parser.add_argument(
         "--score-tolerance",
         type=float,
-        default=0.05,
+        default=0.10,
         help=(
             "Fraction (0.0-1.0) of the best row score used as a proximity "
             "band.  Rows scoring within this fraction of the best score "

@@ -42,7 +42,7 @@ KEY = os.getenv("DOCUMENT_INTELLIGENCE_KEY")
 CALLBACK_URL = os.getenv("CALLBACK_URL")
 _INCH_TO_PT = 72.0
 MAX_FILE_SIZE = 20 * 1024 * 1024
-SCORE_TOLERANCE = 0.05
+SCORE_TOLERANCE = 0.10
 PADDING_PT = 0
 
 # Testing: save redacted PDFs to this directory (set to empty string to disable)
@@ -603,7 +603,7 @@ async def redact_pdf(
     # Dispatch to background task
     background_tasks.add_task(
         process_and_send_webhook,
-        redact_id=redact_id,
+        redact_id=body.redaction_id,
         doc_id=body.doc_id,
         apr_name=body.apr_name,
         bank_cust_no=body.bank_cust_no,
