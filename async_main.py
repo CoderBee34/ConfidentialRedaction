@@ -2,7 +2,6 @@ import os
 import io
 import re
 import base64
-import uuid
 import asyncio
 import logging
 import httpx
@@ -10,7 +9,7 @@ import fitz
 from typing import List
 from dotenv import load_dotenv
 from rapidfuzz.distance import Levenshtein
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -24,10 +23,12 @@ from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
 # ── Request Model ─────────────────────────────────────────────────────────────
 
 class RedactRequest(BaseModel):
+    redaction_id: int = Field(..., description="Redaction identifier")
     apr_name: str = Field(..., description="Applicant name (search value)")
     bank_cust_no: str = Field(..., description="Bank customer number (search value)")
     doc_id: str = Field(..., description="Unique document identifier")
     doc_content: str = Field(..., description="PDF file content encoded as base64")
+    model_config = ConfigDict(populate_by_name=True)
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -468,7 +469,7 @@ def process_redaction(pdf_bytes: bytes, search_texts: List[str], azure_result,
 # ── Background Task Worker ────────────────────────────────────────────────────
 
 async def process_and_send_webhook(
-    job_id: str,
+    redact_id: str,
     doc_id: str,
     apr_name: str,
     bank_cust_no: str,
@@ -483,14 +484,14 @@ async def process_and_send_webhook(
     Background task that processes the PDF and POSTs the result as JSON
     (base64-encoded PDF) to the callback URL.
     """
-    logger.info(f"Job {job_id} started. Processing {filename}.")
+    logger.info(f"Job {redact_id} started. Processing {filename}.")
     
     try:
         # Validate PDF header
         if not pdf_bytes.startswith(b'%PDF'):
             raise ValueError(f"Invalid PDF: missing %PDF header (starts with {pdf_bytes[:20]!r})")
         
-        logger.info(f"Job {job_id}: PDF size={len(pdf_bytes)} bytes, header valid")
+        logger.info(f"Job {redact_id}: PDF size={len(pdf_bytes)} bytes, header valid")
         
         # 1. Call Azure (Async Call) - matching row_redactor_azure.py format
         poller = await azure_client.begin_analyze_document(
@@ -512,40 +513,44 @@ async def process_and_send_webhook(
             output_path = os.path.join(OUTPUT_DIR, f"redacted_{filename}")
             with open(output_path, "wb") as f:
                 f.write(redacted_pdf_bytes)
-            logger.info(f"Job {job_id} saved locally to {output_path}")
+            logger.info(f"Job {redact_id} saved locally to {output_path}")
 
         # 4. Send Result to Callback URL as JSON with base64-encoded PDF
-        logger.info(f"Job {job_id} processing complete. Sending to {callback_url}.")
+        logger.info(f"Job {redact_id} processing complete. Sending to {callback_url}.")
         payload = {
-            "job_id": job_id,
+            "redact_id": redact_id,
             "doc_id": doc_id,
             "apr_name": apr_name,
             "bank_cust_no": bank_cust_no,
-            "status": "completed",
+            "status_no": 0,
+            "message": "completed",
             "doc_content": base64.b64encode(redacted_pdf_bytes).decode("utf-8"),
         }
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(callback_url, json=payload)
             response.raise_for_status()
-            logger.info(f"Job {job_id} successfully delivered to webhook.")
+            logger.info(f"Job {redact_id} successfully delivered to webhook.")
 
     except Exception as e:
-        logger.error(f"Job {job_id} failed: {str(e)}")
+        logger.error(f"Job {redact_id} failed: {str(e)}")
         # Attempt to notify the callback URL about the failure
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 await client.post(
                     callback_url,
                     json={
-                        'job_id': job_id,
+                        'redact_id': redact_id,
                         'doc_id': doc_id,
-                        'status': 'failed',
-                        'error': str(e),
+                        "apr_name": apr_name,
+                        "bank_cust_no": bank_cust_no,
+                        "status_no": 1,
+                        'message': 'processing failed',
+                        "doc_content": None
                     }
                 )
         except Exception as webhook_err:
-            logger.error(f"Job {job_id} failed to send error webhook: {str(webhook_err)}")
+            logger.error(f"Job {redact_id} failed to send error webhook: {str(webhook_err)}")
 
 
 # ── API Endpoint ──────────────────────────────────────────────────────────────
@@ -587,8 +592,8 @@ async def redact_pdf(
     if not search_list:
         raise HTTPException(status_code=400, detail="No search values provided")
 
-    # Generate a unique job ID (same doc can be processed multiple times)
-    job_id = str(uuid.uuid4())
+    # Generate a unique redact ID (same doc can be processed multiple times)
+    redact_id = body.redaction_id
 
     # Build output filename from search inputs
     safe_name = re.sub(r'[^\w\s-]', '', body.apr_name.strip()).strip().replace(' ', '_')
@@ -598,7 +603,7 @@ async def redact_pdf(
     # Dispatch to background task
     background_tasks.add_task(
         process_and_send_webhook,
-        job_id=job_id,
+        redact_id=redact_id,
         doc_id=body.doc_id,
         apr_name=body.apr_name,
         bank_cust_no=body.bank_cust_no,
@@ -614,9 +619,9 @@ async def redact_pdf(
     return JSONResponse(
         status_code=202,
         content={
-            "job_id": job_id,
+            "redact_id": redact_id,
             "doc_id": body.doc_id,
-            "status": "processing",
+            "status_no": 2,
             "message": "File accepted for processing. Result will be sent to the callback URL."
         }
     )
