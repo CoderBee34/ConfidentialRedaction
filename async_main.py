@@ -19,6 +19,8 @@ from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence.aio import DocumentIntelligenceClient
 from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
 
+from mongo_cache import AzureResultCache
+
 
 # ── Request Model ─────────────────────────────────────────────────────────────
 
@@ -40,6 +42,12 @@ logger = logging.getLogger(__name__)
 ENDPOINT = os.getenv("DOCUMENT_INTELLIGENCE_ENDPOINT")
 KEY = os.getenv("DOCUMENT_INTELLIGENCE_KEY")
 CALLBACK_URL = os.getenv("CALLBACK_URL")
+MONGO_USERNAME = os.getenv("MONGO_USERNAME")
+MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
+MONGO_SERVER_IP = os.getenv("MONGO_SERVER_IP")
+MONGO_PORT = os.getenv("MONGO_PORT")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME")
+MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME")
 _INCH_TO_PT = 72.0
 MAX_FILE_SIZE = 20 * 1024 * 1024
 SCORE_TOLERANCE = 0.10
@@ -51,16 +59,33 @@ OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
 if not ENDPOINT or not KEY:
     raise RuntimeError("Missing Azure credentials in environment variables.")
 
-# Initialize client once to reuse connection pools
+if not all([MONGO_USERNAME, MONGO_PASSWORD, MONGO_SERVER_IP, MONGO_PORT, MONGO_DB_NAME, MONGO_COLLECTION_NAME]):
+    raise RuntimeError("Missing MongoDB credentials in environment variables.")
+
+# Initialize clients once to reuse connection pools
 azure_client = None
+azure_cache: AzureResultCache = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global azure_client
+    global azure_client, azure_cache
     azure_client = DocumentIntelligenceClient(
         endpoint=ENDPOINT, credential=AzureKeyCredential(KEY)
     )
+    azure_cache = AzureResultCache(
+        username=MONGO_USERNAME,
+        password=MONGO_PASSWORD,
+        server_ip=MONGO_SERVER_IP,
+        port=MONGO_PORT,
+        db_name=MONGO_DB_NAME,
+        collection_name=MONGO_COLLECTION_NAME,
+    )
+    await azure_cache.connect()
     yield
+    try:
+        await azure_cache.close()
+    except Exception:
+        pass
     try:
         await azure_client.close()
     except Exception:
@@ -493,13 +518,20 @@ async def process_and_send_webhook(
         
         logger.info(f"Job {redact_id}: PDF size={len(pdf_bytes)} bytes, header valid")
         
-        # 1. Call Azure (Async Call) - matching row_redactor_azure.py format
-        poller = await azure_client.begin_analyze_document(
-            "prebuilt-layout",
-            AnalyzeDocumentRequest(bytes_source=bytes(pdf_bytes)),
-            locale="tr-TR"
-        )
-        result = await poller.result()
+        # 1. Check MongoDB cache; call Azure only on cache miss
+        result = await azure_cache.get(doc_id)
+
+        if result is None:
+            logger.info(f"Job {redact_id}: Calling Azure DI for doc_id={doc_id}")
+            poller = await azure_client.begin_analyze_document(
+                "prebuilt-layout",
+                AnalyzeDocumentRequest(bytes_source=bytes(pdf_bytes)),
+                locale="tr-TR"
+            )
+            result = await poller.result()
+            await azure_cache.put(doc_id, result)
+        else:
+            logger.info(f"Job {redact_id}: Using cached Azure result for doc_id={doc_id}")
 
         # 2. Process PDF (Offload CPU-bound task to thread)
         redacted_pdf_bytes = await asyncio.to_thread(

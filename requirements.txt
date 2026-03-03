@@ -1,5 +1,9 @@
 PyMuPDF==1.27.1
-pillow==12.1.1
 python-dotenv
 azure-ai-documentintelligence
 rapidfuzz
+fastapi
+pydantic
+httpx
+uvicorn
+motor
