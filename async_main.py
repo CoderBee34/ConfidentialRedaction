@@ -36,7 +36,16 @@ class RedactRequest(BaseModel):
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
+
+os.makedirs("logs", exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("logs/app.log", encoding="utf-8"),
+    ],
+)
 logger = logging.getLogger(__name__)
 
 ENDPOINT = os.getenv("DOCUMENT_INTELLIGENCE_ENDPOINT")
@@ -85,11 +94,11 @@ async def lifespan(app: FastAPI):
     try:
         await azure_cache.close()
     except Exception:
-        pass
+        logger.exception("Error closing MongoDB cache during shutdown.")
     try:
         await azure_client.close()
     except Exception:
-        pass
+        logger.exception("Error closing Azure DI client during shutdown.")
 
 app = FastAPI(title="PDF Redactor API - Async Webhook", lifespan=lifespan)
 
@@ -565,7 +574,7 @@ async def process_and_send_webhook(
             logger.info(f"Job {redact_id} successfully delivered to webhook.")
 
     except Exception as e:
-        logger.error(f"Job {redact_id} failed: {str(e)}")
+        logger.exception(f"Job {redact_id} failed: {str(e)}")
         # Attempt to notify the callback URL about the failure
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -582,7 +591,7 @@ async def process_and_send_webhook(
                     }
                 )
         except Exception as webhook_err:
-            logger.error(f"Job {redact_id} failed to send error webhook: {str(webhook_err)}")
+            logger.exception(f"Job {redact_id} failed to send error webhook: {str(webhook_err)}")
 
 
 # ── API Endpoint ──────────────────────────────────────────────────────────────
