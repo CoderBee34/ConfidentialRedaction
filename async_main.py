@@ -59,7 +59,8 @@ MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
 MONGO_SERVER_IP = os.getenv("MONGO_SERVER_IP")
 MONGO_PORT = os.getenv("MONGO_PORT")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME")
-MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME")
+MONGO_COLLECTION_NAME_PROD = os.getenv("MONGO_COLLECTION_NAME_PROD")
+MONGO_COLLECTION_NAME_TEST = os.getenv("MONGO_COLLECTION_NAME_TEST")
 _INCH_TO_PT = 72.0
 MAX_FILE_SIZE = 20 * 1024 * 1024
 SCORE_TOLERANCE = 0.10
@@ -71,33 +72,44 @@ OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
 if not ENDPOINT or not KEY:
     raise RuntimeError("Missing Azure credentials in environment variables.")
 
-if not all([MONGO_USERNAME, MONGO_PASSWORD, MONGO_SERVER_IP, MONGO_PORT, MONGO_DB_NAME, MONGO_COLLECTION_NAME]):
+if not all([MONGO_USERNAME, MONGO_PASSWORD, MONGO_SERVER_IP, MONGO_PORT, MONGO_DB_NAME, MONGO_COLLECTION_NAME_PROD, MONGO_COLLECTION_NAME_TEST]):
     raise RuntimeError("Missing MongoDB credentials in environment variables.")
 
 # Initialize clients once to reuse connection pools
 azure_client = None
-azure_cache: AzureResultCache = None
+azure_cache_prod: AzureResultCache = None
+azure_cache_test: AzureResultCache = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global azure_client, azure_cache
+    global azure_client, azure_cache_prod, azure_cache_test
     azure_client = DocumentIntelligenceClient(
         endpoint=ENDPOINT, credential=AzureKeyCredential(KEY)
     )
-    azure_cache = AzureResultCache(
+    azure_cache_prod = AzureResultCache(
         username=MONGO_USERNAME,
         password=MONGO_PASSWORD,
         server_ip=MONGO_SERVER_IP,
         port=MONGO_PORT,
         db_name=MONGO_DB_NAME,
-        collection_name=MONGO_COLLECTION_NAME,
+        collection_name=MONGO_COLLECTION_NAME_PROD,
     )
-    await azure_cache.connect()
+    azure_cache_test = AzureResultCache(
+        username=MONGO_USERNAME,
+        password=MONGO_PASSWORD,
+        server_ip=MONGO_SERVER_IP,
+        port=MONGO_PORT,
+        db_name=MONGO_DB_NAME,
+        collection_name=MONGO_COLLECTION_NAME_TEST,
+    )
+    await azure_cache_prod.connect()
+    await azure_cache_test.connect()
     yield
-    try:
-        await azure_cache.close()
-    except Exception:
-        logger.exception("Error closing MongoDB cache during shutdown.")
+    for cache, name in [(azure_cache_prod, "prod"), (azure_cache_test, "test")]:
+        try:
+            await cache.close()
+        except Exception:
+            logger.exception(f"Error closing MongoDB {name} cache during shutdown.")
     try:
         await azure_client.close()
     except Exception:
@@ -516,7 +528,8 @@ async def process_and_send_webhook(
     score_tolerance: float,
     filename: str,
     callback_url: str,
-    callback_secret: str
+    callback_secret: str,
+    cache: AzureResultCache = None,
 ):
     """
     Background task that processes the PDF and POSTs the result as JSON
@@ -532,7 +545,8 @@ async def process_and_send_webhook(
         logger.info(f"Job {redact_id}: PDF size={len(pdf_bytes)} bytes, header valid")
         
         # 1. Check MongoDB cache; call Azure only on cache miss
-        result = await azure_cache.get(doc_id)
+        active_cache = cache or azure_cache_prod
+        result = await active_cache.get(doc_id)
 
         if result is None:
             logger.info(f"Job {redact_id}: Calling Azure DI for doc_id={doc_id}")
@@ -542,7 +556,7 @@ async def process_and_send_webhook(
                 locale="tr-TR"
             )
             result = await poller.result()
-            await azure_cache.put(doc_id, result)
+            await active_cache.put(doc_id, result)
         else:
             logger.info(f"Job {redact_id}: Using cached Azure result for doc_id={doc_id}")
 
@@ -606,6 +620,7 @@ async def _handle_redact_request(
     background_tasks: BackgroundTasks,
     callback_url: str,
     callback_secret: str,
+    cache: AzureResultCache = None,
 ) -> JSONResponse:
     """
     Shared logic for /test/redact and /prod/redact.
@@ -660,6 +675,7 @@ async def _handle_redact_request(
         filename=filename,
         callback_url=callback_url,
         callback_secret=callback_secret,
+        cache=cache,
     )
 
     return JSONResponse(
@@ -689,6 +705,7 @@ async def redact_pdf_test(
         body, background_tasks,
         callback_url=CALLBACK_URL_TEST,
         callback_secret=CALLBACK_URL_SECRET_TEST,
+        cache=azure_cache_test,
     )
 
 
@@ -706,4 +723,5 @@ async def redact_pdf_prod(
         body, background_tasks,
         callback_url=CALLBACK_URL_PROD,
         callback_secret=CALLBACK_URL_SECRET_PROD,
+        cache=azure_cache_prod,
     )
