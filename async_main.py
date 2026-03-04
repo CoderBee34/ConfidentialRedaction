@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 ENDPOINT = os.getenv("DOCUMENT_INTELLIGENCE_ENDPOINT")
 KEY = os.getenv("DOCUMENT_INTELLIGENCE_KEY")
 CALLBACK_URL = os.getenv("CALLBACK_URL")
+CALLBACK_URL_SECRET = os.getenv("CALLBACK_URL_SECRET")
 MONGO_USERNAME = os.getenv("MONGO_USERNAME")
 MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
 MONGO_SERVER_IP = os.getenv("MONGO_SERVER_IP")
@@ -560,16 +561,18 @@ async def process_and_send_webhook(
         logger.info(f"Job {redact_id} processing complete. Sending to {callback_url}.")
         payload = {
             "redact_id": redact_id,
-            "doc_id": doc_id,
             "apr_name": apr_name,
             "bank_cust_no": bank_cust_no,
             "status_no": 0,
-            "message": "completed",
-            "doc_content": base64.b64encode(redacted_pdf_bytes).decode("utf-8"),
+            "doc_content": base64.b64encode(redacted_pdf_bytes).decode("utf-8")
         }
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(callback_url, json=payload)
+            response = await client.post(
+                callback_url,
+                json=payload,
+                headers={"Authorization": f"Bearer {CALLBACK_URL_SECRET}"}
+            )
             response.raise_for_status()
             logger.info(f"Job {redact_id} successfully delivered to webhook.")
 
@@ -582,13 +585,12 @@ async def process_and_send_webhook(
                     callback_url,
                     json={
                         'redact_id': redact_id,
-                        'doc_id': doc_id,
                         "apr_name": apr_name,
                         "bank_cust_no": bank_cust_no,
                         "status_no": 1,
-                        'message': 'processing failed',
                         "doc_content": None
-                    }
+                    },
+                    headers={"Authorization": f"Bearer {CALLBACK_URL_SECRET}"}
                 )
         except Exception as webhook_err:
             logger.exception(f"Job {redact_id} failed to send error webhook: {str(webhook_err)}")
