@@ -50,8 +50,10 @@ logger = logging.getLogger(__name__)
 
 ENDPOINT = os.getenv("DOCUMENT_INTELLIGENCE_ENDPOINT")
 KEY = os.getenv("DOCUMENT_INTELLIGENCE_KEY")
-CALLBACK_URL = os.getenv("CALLBACK_URL")
-CALLBACK_URL_SECRET = os.getenv("CALLBACK_URL_SECRET")
+CALLBACK_URL_TEST = os.getenv("CALLBACK_URL_TEST")
+CALLBACK_URL_SECRET_TEST = os.getenv("CALLBACK_URL_SECRET_TEST")
+CALLBACK_URL_PROD = os.getenv("CALLBACK_URL_PROD")
+CALLBACK_URL_SECRET_PROD = os.getenv("CALLBACK_URL_SECRET_PROD")
 MONGO_USERNAME = os.getenv("MONGO_USERNAME")
 MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
 MONGO_SERVER_IP = os.getenv("MONGO_SERVER_IP")
@@ -513,7 +515,8 @@ async def process_and_send_webhook(
     padding: float,
     score_tolerance: float,
     filename: str,
-    callback_url: str
+    callback_url: str,
+    callback_secret: str
 ):
     """
     Background task that processes the PDF and POSTs the result as JSON
@@ -571,7 +574,7 @@ async def process_and_send_webhook(
             response = await client.post(
                 callback_url,
                 json=payload,
-                headers={"Authorization": f"Bearer {CALLBACK_URL_SECRET}"}
+                headers={"Authorization": f"Bearer {callback_secret}"}
             )
             response.raise_for_status()
             logger.info(f"Job {redact_id} successfully delivered to webhook.")
@@ -590,24 +593,27 @@ async def process_and_send_webhook(
                         "status_no": 1,
                         "doc_content": None
                     },
-                    headers={"Authorization": f"Bearer {CALLBACK_URL_SECRET}"}
+                    headers={"Authorization": f"Bearer {callback_secret}"}
                 )
         except Exception as webhook_err:
             logger.exception(f"Job {redact_id} failed to send error webhook: {str(webhook_err)}")
 
 
-# ── API Endpoint ──────────────────────────────────────────────────────────────
+# ── Shared endpoint logic ─────────────────────────────────────────────────────
 
-@app.post("/redact", status_code=202)
-async def redact_pdf(
+async def _handle_redact_request(
     body: RedactRequest,
     background_tasks: BackgroundTasks,
-):
+    callback_url: str,
+    callback_secret: str,
+) -> JSONResponse:
     """
-    Accept a JSON payload with a base64-encoded PDF and search values.
-    Returns immediately with the doc_id. 
-    The redacted PDF will be POSTed to the callback URL.
+    Shared logic for /test/redact and /prod/redact.
+    Validates the request, then dispatches a background processing task.
     """
+    if not callback_url or not callback_secret:
+        raise HTTPException(status_code=503, detail="Callback URL/secret not configured for this environment.")
+
     # Decode base64 PDF content
     try:
         pdf_bytes = base64.b64decode(body.doc_content)
@@ -620,13 +626,13 @@ async def redact_pdf(
     # Validate PDF header
     if not pdf_bytes.startswith(b'%PDF'):
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail=f"Invalid PDF: missing %PDF header (got: {pdf_bytes[:20]!r})"
         )
 
     if len(pdf_bytes) > MAX_FILE_SIZE:
         raise HTTPException(
-            status_code=413, 
+            status_code=413,
             detail=f"File too large. Maximum size allowed is {MAX_FILE_SIZE / (1024 * 1024)}MB."
         )
 
@@ -635,15 +641,12 @@ async def redact_pdf(
     if not search_list:
         raise HTTPException(status_code=400, detail="No search values provided")
 
-    # Generate a unique redact ID (same doc can be processed multiple times)
     redact_id = body.redaction_id
 
-    # Build output filename from search inputs
     safe_name = re.sub(r'[^\w\s-]', '', body.apr_name.strip()).strip().replace(' ', '_')
     safe_cust = re.sub(r'[^\w-]', '', body.bank_cust_no.strip())
     filename = f"{safe_name}_{safe_cust}_{body.doc_id}.pdf"
 
-    # Dispatch to background task
     background_tasks.add_task(
         process_and_send_webhook,
         redact_id=body.redaction_id,
@@ -655,10 +658,10 @@ async def redact_pdf(
         padding=PADDING_PT,
         score_tolerance=SCORE_TOLERANCE,
         filename=filename,
-        callback_url=CALLBACK_URL
+        callback_url=callback_url,
+        callback_secret=callback_secret,
     )
 
-    # Return immediately (202 Accepted is the standard for async job creation)
     return JSONResponse(
         status_code=202,
         content={
@@ -667,4 +670,40 @@ async def redact_pdf(
             "status_no": 2,
             "message": "File accepted for processing. Result will be sent to the callback URL."
         }
+    )
+
+
+# ── API Endpoints ─────────────────────────────────────────────────────────────
+
+@app.post("/test/redact", status_code=202)
+async def redact_pdf_test(
+    body: RedactRequest,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Accept a JSON payload with a base64-encoded PDF and search values.
+    Returns immediately with the doc_id.
+    The redacted PDF will be POSTed to the TEST callback URL.
+    """
+    return await _handle_redact_request(
+        body, background_tasks,
+        callback_url=CALLBACK_URL_TEST,
+        callback_secret=CALLBACK_URL_SECRET_TEST,
+    )
+
+
+@app.post("/prod/redact", status_code=202)
+async def redact_pdf_prod(
+    body: RedactRequest,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Accept a JSON payload with a base64-encoded PDF and search values.
+    Returns immediately with the doc_id.
+    The redacted PDF will be POSTed to the PRODUCTION callback URL.
+    """
+    return await _handle_redact_request(
+        body, background_tasks,
+        callback_url=CALLBACK_URL_PROD,
+        callback_secret=CALLBACK_URL_SECRET_PROD,
     )
