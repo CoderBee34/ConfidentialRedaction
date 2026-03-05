@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import time
 import base64
 import asyncio
 import logging
@@ -37,13 +38,11 @@ class RedactRequest(BaseModel):
 
 load_dotenv()
 
-os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("logs/app.log", encoding="utf-8"),
     ],
 )
 logger = logging.getLogger(__name__)
@@ -51,9 +50,13 @@ logger = logging.getLogger(__name__)
 ENDPOINT = os.getenv("DOCUMENT_INTELLIGENCE_ENDPOINT")
 KEY = os.getenv("DOCUMENT_INTELLIGENCE_KEY")
 CALLBACK_URL_TEST = os.getenv("CALLBACK_URL_TEST")
-CALLBACK_URL_SECRET_TEST = os.getenv("CALLBACK_URL_SECRET_TEST")
+CALLBACK_SECRET_URL_TEST = os.getenv("CALLBACK_SECRET_URL_TEST")
+SECRET_URL_USERNAME_TEST = os.getenv("SECRET_URL_USERNAME_TEST")
+SECRET_URL_PASSWORD_TEST = os.getenv("SECRET_URL_PASSWORD_TEST")
 CALLBACK_URL_PROD = os.getenv("CALLBACK_URL_PROD")
-CALLBACK_URL_SECRET_PROD = os.getenv("CALLBACK_URL_SECRET_PROD")
+CALLBACK_SECRET_URL_PROD = os.getenv("CALLBACK_SECRET_URL_PROD")
+SECRET_URL_USERNAME_PROD = os.getenv("SECRET_URL_USERNAME_PROD")
+SECRET_URL_PASSWORD_PROD = os.getenv("SECRET_URL_PASSWORD_PROD")
 MONGO_USERNAME = os.getenv("MONGO_USERNAME")
 MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
 MONGO_SERVER_IP = os.getenv("MONGO_SERVER_IP")
@@ -74,6 +77,95 @@ if not ENDPOINT or not KEY:
 
 if not all([MONGO_USERNAME, MONGO_PASSWORD, MONGO_SERVER_IP, MONGO_PORT, MONGO_DB_NAME, MONGO_COLLECTION_NAME_PROD, MONGO_COLLECTION_NAME_TEST]):
     raise RuntimeError("Missing MongoDB credentials in environment variables.")
+
+if not all([CALLBACK_SECRET_URL_TEST, SECRET_URL_USERNAME_TEST, SECRET_URL_PASSWORD_TEST,
+            CALLBACK_SECRET_URL_PROD, SECRET_URL_USERNAME_PROD, SECRET_URL_PASSWORD_PROD]):
+    raise RuntimeError("Missing token-endpoint credentials in environment variables.")
+
+
+# ── Token Manager ─────────────────────────────────────────────────────────────
+
+class TokenManager:
+
+    def __init__(self, secret_url: str, username: str, password: str,
+                 buffer_seconds: int = 60):
+        self._url = secret_url
+        self._username = username
+        self._password = password
+        self._buffer = buffer_seconds
+        self._token: str | None = None
+        self._expires_at: float = 0.0  # Unix timestamp
+        self._lock: asyncio.Lock | None = None  # Lazily created inside the running event loop
+
+    @property
+    def _get_lock(self) -> asyncio.Lock:
+        """Return the lock, creating it on first access within the running event loop."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def get_token(self) -> str:
+        """Return a valid token, fetching a new one from the secret URL if needed."""
+        async with self._get_lock:
+            if self._token and time.time() < self._expires_at - self._buffer:
+                return self._token
+            await self._fetch_token()
+            return self._token
+
+    async def _fetch_token(self) -> None:
+        from datetime import datetime
+        payload = {"UserId": self._username, "Password": self._password}
+        logger.info(f"Fetching new token from {self._url}")
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(self._url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+        # Response shape: {"status": 201, "result": {"access_token": "...", "expires_in": "3/5/2026 12:19:54 PM"}, ...}
+        result = data.get("result") or {}
+        token = result.get("access_token")
+        if not token:
+            raise ValueError(
+                f"Token field not found in secret-URL response. "
+                f"Response: {data}"
+            )
+
+        # expires_in is a datetime string: "M/D/YYYY h:mm:ss AM/PM"
+        now = time.time()
+        expires_in_str = result.get("expires_in")
+        if expires_in_str:
+            try:
+                dt = datetime.strptime(str(expires_in_str), "%m/%d/%Y %I:%M:%S %p")
+                self._expires_at = dt.timestamp()
+            except ValueError:
+                # Fallback: try ISO format
+                try:
+                    dt = datetime.fromisoformat(str(expires_in_str).replace("Z", "+00:00"))
+                    self._expires_at = dt.timestamp()
+                except Exception:
+                    self._expires_at = now + 3600
+        else:
+            self._expires_at = now + 3600  # default: 1 hour
+
+        self._token = token
+        logger.info(
+            f"Token refreshed from {self._url}; "
+            f"expires in {self._expires_at - now:.0f}s"
+        )
+
+
+# ── Token manager singletons (initialised at module load from env vars) ───────
+
+token_manager_test = TokenManager(
+    secret_url=CALLBACK_SECRET_URL_TEST,
+    username=SECRET_URL_USERNAME_TEST,
+    password=SECRET_URL_PASSWORD_TEST,
+)
+token_manager_prod = TokenManager(
+    secret_url=CALLBACK_SECRET_URL_PROD,
+    username=SECRET_URL_USERNAME_PROD,
+    password=SECRET_URL_PASSWORD_PROD,
+)
 
 # Initialize clients once to reuse connection pools
 azure_client = None
@@ -528,7 +620,7 @@ async def process_and_send_webhook(
     score_tolerance: float,
     filename: str,
     callback_url: str,
-    callback_secret: str,
+    token_manager: TokenManager,
     cache: AzureResultCache = None,
 ):
     """
@@ -576,6 +668,8 @@ async def process_and_send_webhook(
 
         # 4. Send Result to Callback URL as JSON with base64-encoded PDF
         logger.info(f"Job {redact_id} processing complete. Sending to {callback_url}.")
+        secret_token = await token_manager.get_token()
+        logger.info(f"Job {redact_id} header token {secret_token}")
         payload = {
             "redact_id": redact_id,
             "apr_name": apr_name,
@@ -584,11 +678,26 @@ async def process_and_send_webhook(
             "doc_content": base64.b64encode(redacted_pdf_bytes).decode("utf-8")
         }
 
+        req_headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {secret_token}"
+        }
+        logger.info(
+            f"Job {redact_id} sending to callback URL: {callback_url}\n"
+            f"  Request headers: {req_headers}\n"
+            f"  Payload keys: {list(payload.keys())}"
+        )
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 callback_url,
                 json=payload,
-                headers={"Authorization": f"Bearer {callback_secret}"}
+                headers=req_headers,
+            )
+            logger.info(
+                f"Job {redact_id} callback response:\n"
+                f"  Status: {response.status_code}\n"
+                f"  Response headers: {dict(response.headers)}\n"
+                f"  Body: {response.text[:10]}"
             )
             response.raise_for_status()
             logger.info(f"Job {redact_id} successfully delivered to webhook.")
@@ -597,17 +706,33 @@ async def process_and_send_webhook(
         logger.exception(f"Job {redact_id} failed: {str(e)}")
         # Attempt to notify the callback URL about the failure
         try:
+            err_token = await token_manager.get_token()
+            err_headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {err_token}"
+            }
+            err_payload = {
+                'redact_id': redact_id,
+                "apr_name": apr_name,
+                "bank_cust_no": bank_cust_no,
+                "status_no": 1,
+                "doc_content": None
+            }
+            logger.info(
+                f"Job {redact_id} sending error callback to: {callback_url}\n"
+                f"  Request headers: {err_headers}"
+            )
             async with httpx.AsyncClient(timeout=10.0) as client:
-                await client.post(
+                err_response = await client.post(
                     callback_url,
-                    json={
-                        'redact_id': redact_id,
-                        "apr_name": apr_name,
-                        "bank_cust_no": bank_cust_no,
-                        "status_no": 1,
-                        "doc_content": None
-                    },
-                    headers={"Authorization": f"Bearer {callback_secret}"}
+                    json=err_payload,
+                    headers=err_headers,
+                )
+                logger.info(
+                    f"Job {redact_id} error callback response:\n"
+                    f"  Status: {err_response.status_code}\n"
+                    f"  Response headers: {dict(err_response.headers)}\n"
+                    f"  Body: {err_response.text[:10]}"
                 )
         except Exception as webhook_err:
             logger.exception(f"Job {redact_id} failed to send error webhook: {str(webhook_err)}")
@@ -619,15 +744,15 @@ async def _handle_redact_request(
     body: RedactRequest,
     background_tasks: BackgroundTasks,
     callback_url: str,
-    callback_secret: str,
+    token_manager: TokenManager,
     cache: AzureResultCache = None,
 ) -> JSONResponse:
     """
     Shared logic for /test/redact and /prod/redact.
     Validates the request, then dispatches a background processing task.
     """
-    if not callback_url or not callback_secret:
-        raise HTTPException(status_code=503, detail="Callback URL/secret not configured for this environment.")
+    if not callback_url:
+        raise HTTPException(status_code=503, detail="Callback URL not configured for this environment.")
 
     # Decode base64 PDF content
     try:
@@ -674,7 +799,7 @@ async def _handle_redact_request(
         score_tolerance=SCORE_TOLERANCE,
         filename=filename,
         callback_url=callback_url,
-        callback_secret=callback_secret,
+        token_manager=token_manager,
         cache=cache,
     )
 
@@ -704,7 +829,7 @@ async def redact_pdf_test(
     return await _handle_redact_request(
         body, background_tasks,
         callback_url=CALLBACK_URL_TEST,
-        callback_secret=CALLBACK_URL_SECRET_TEST,
+        token_manager=token_manager_test,
         cache=azure_cache_test,
     )
 
@@ -722,6 +847,6 @@ async def redact_pdf_prod(
     return await _handle_redact_request(
         body, background_tasks,
         callback_url=CALLBACK_URL_PROD,
-        callback_secret=CALLBACK_URL_SECRET_PROD,
+        token_manager=token_manager_prod,
         cache=azure_cache_prod,
     )
