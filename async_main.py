@@ -17,10 +17,12 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import HttpResponseError
 from azure.ai.documentintelligence.aio import DocumentIntelligenceClient
-from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
+from azure.ai.documentintelligence.models import AnalyzeDocumentRequest, AnalyzeResult
 
 from mongo_cache import AzureResultCache
+from logging_config import setup_logging
 
 
 # ── Request Model ─────────────────────────────────────────────────────────────
@@ -37,14 +39,7 @@ class RedactRequest(BaseModel):
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-    ],
-)
+setup_logging()
 logger = logging.getLogger(__name__)
 
 ENDPOINT = os.getenv("DOCUMENT_INTELLIGENCE_ENDPOINT")
@@ -65,9 +60,17 @@ MONGO_DB_NAME = os.getenv("MONGO_DB_NAME")
 MONGO_COLLECTION_NAME_PROD = os.getenv("MONGO_COLLECTION_NAME_PROD")
 MONGO_COLLECTION_NAME_TEST = os.getenv("MONGO_COLLECTION_NAME_TEST")
 _INCH_TO_PT = 72.0
-MAX_FILE_SIZE = 20 * 1024 * 1024
+MAX_FILE_SIZE = 40 * 1024 * 1024
 SCORE_TOLERANCE = 0.10
 PADDING_PT = 0
+
+# Worker-aware Azure rate-limiting
+NUM_WORKERS = int(os.getenv("NUM_WORKERS", "4"))
+AZURE_TPS_LIMIT = int(os.getenv("AZURE_TPS_LIMIT", "13"))
+PER_WORKER_TPS = AZURE_TPS_LIMIT / NUM_WORKERS
+AZURE_MAX_RETRIES = int(os.getenv("AZURE_MAX_RETRIES", "3"))
+CALLBACK_MAX_RETRIES = int(os.getenv("CALLBACK_MAX_RETRIES", "3"))
+CACHE_WAIT_TIMEOUT = float(os.getenv("CACHE_WAIT_TIMEOUT", "120"))
 
 # Testing: save redacted PDFs to this directory (set to empty string to disable)
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
@@ -81,6 +84,50 @@ if not all([MONGO_USERNAME, MONGO_PASSWORD, MONGO_SERVER_IP, MONGO_PORT, MONGO_D
 if not all([CALLBACK_SECRET_URL_TEST, SECRET_URL_USERNAME_TEST, SECRET_URL_PASSWORD_TEST,
             CALLBACK_SECRET_URL_PROD, SECRET_URL_USERNAME_PROD, SECRET_URL_PASSWORD_PROD]):
     raise RuntimeError("Missing token-endpoint credentials in environment variables.")
+
+
+# ── Async Rate Limiter (token-bucket) ─────────────────────────────────────────
+
+class AsyncRateLimiter:
+    """
+    Per-worker async token-bucket rate limiter.
+
+    Each uvicorn worker process gets its own instance.  Set
+    ``AZURE_TPS_LIMIT`` and ``NUM_WORKERS`` so that
+    ``rate = AZURE_TPS_LIMIT / NUM_WORKERS``.
+    """
+
+    def __init__(self, rate: float, burst: int | None = None):
+        self._rate = rate
+        self._burst = burst or max(1, int(rate))
+        self._tokens = float(self._burst)
+        self._last_refill = time.monotonic()
+        self._lock: asyncio.Lock | None = None
+
+    @property
+    def _ensure_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def acquire(self) -> None:
+        """Wait until a token is available, then consume it."""
+        while True:
+            async with self._ensure_lock:
+                now = time.monotonic()
+                elapsed = now - self._last_refill
+                self._tokens = min(
+                    self._burst, self._tokens + elapsed * self._rate,
+                )
+                self._last_refill = now
+
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+
+                wait_time = (1.0 - self._tokens) / self._rate
+
+            await asyncio.sleep(wait_time)
 
 
 # ── Token Manager ─────────────────────────────────────────────────────────────
@@ -171,10 +218,16 @@ token_manager_prod = TokenManager(
 azure_client = None
 azure_cache_prod: AzureResultCache = None
 azure_cache_test: AzureResultCache = None
+http_client: httpx.AsyncClient = None
+azure_rate_limiter: AsyncRateLimiter = None
+
+# Limit concurrent background processing tasks to avoid connection exhaustion
+MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "10"))
+_job_semaphore: asyncio.Semaphore = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global azure_client, azure_cache_prod, azure_cache_test
+    global azure_client, azure_cache_prod, azure_cache_test, http_client, azure_rate_limiter, _job_semaphore
     azure_client = DocumentIntelligenceClient(
         endpoint=ENDPOINT, credential=AzureKeyCredential(KEY)
     )
@@ -196,6 +249,21 @@ async def lifespan(app: FastAPI):
     )
     await azure_cache_prod.connect()
     await azure_cache_test.connect()
+    # Shared HTTP client with connection pool limits
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=15.0, read=30.0, write=30.0, pool=30.0),
+        limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+    )
+    azure_rate_limiter = AsyncRateLimiter(
+        rate=PER_WORKER_TPS,
+        burst=max(1, int(PER_WORKER_TPS)),
+    )
+    _job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+    logger.info(
+        f"Startup complete. Workers={NUM_WORKERS}, "
+        f"Azure TPS/worker={PER_WORKER_TPS:.1f}, "
+        f"Max concurrent jobs={MAX_CONCURRENT_JOBS}"
+    )
     yield
     for cache, name in [(azure_cache_prod, "prod"), (azure_cache_test, "test")]:
         try:
@@ -206,6 +274,10 @@ async def lifespan(app: FastAPI):
         await azure_client.close()
     except Exception:
         logger.exception("Error closing Azure DI client during shutdown.")
+    try:
+        await http_client.aclose()
+    except Exception:
+        logger.exception("Error closing shared HTTP client during shutdown.")
 
 app = FastAPI(title="PDF Redactor API - Async Webhook", lifespan=lifespan)
 
@@ -607,7 +679,73 @@ def process_redaction(pdf_bytes: bytes, search_texts: List[str], azure_result,
     doc.close()
     return output_buffer.getvalue()
 
-# ── Background Task Worker ────────────────────────────────────────────────────
+# ── Background Task Worker ────────────────────────────────────────────
+
+async def call_azure_with_retry(
+    pdf_bytes: bytes, max_retries: int = AZURE_MAX_RETRIES,
+) -> AnalyzeResult:
+    """
+    Call Azure Document Intelligence with per-worker rate limiting
+    and exponential back-off on 429 (Too Many Requests).
+    """
+    for attempt in range(max_retries + 1):
+        await azure_rate_limiter.acquire()
+        try:
+            poller = await azure_client.begin_analyze_document(
+                "prebuilt-layout",
+                AnalyzeDocumentRequest(bytes_source=bytes(pdf_bytes)),
+                locale="tr-TR",
+            )
+            return await poller.result()
+        except HttpResponseError as exc:
+            if exc.status_code == 429 and attempt < max_retries:
+                retry_after = float(
+                    exc.response.headers.get("Retry-After", str(2 ** (attempt + 1)))
+                )
+                logger.warning(
+                    "Azure 429 rate-limited (attempt %d/%d), retrying in %.1fs",
+                    attempt + 1, max_retries, retry_after,
+                )
+                await asyncio.sleep(retry_after)
+            else:
+                raise
+    raise RuntimeError("Azure API call failed after all retries")
+
+
+async def _post_with_retry(
+    url: str,
+    json: dict,
+    headers: dict,
+    max_retries: int = CALLBACK_MAX_RETRIES,
+    label: str = "callback",
+) -> httpx.Response:
+    """
+    POST to *url* with exponential back-off on transient network errors
+    (connect timeout, read timeout, connection reset, etc.).
+    """
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            response = await http_client.post(url, json=json, headers=headers)
+            return response
+        except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout,
+                httpx.PoolTimeout, httpx.ConnectError) as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                delay = 2 ** (attempt + 1)  # 2, 4, 8 …
+                logger.warning(
+                    "%s attempt %d/%d failed (%s), retrying in %ds",
+                    label, attempt + 1, max_retries, type(exc).__name__, delay,
+                )
+                await asyncio.sleep(delay)
+            else:
+                logger.error(
+                    "%s failed after %d retries: %s",
+                    label, max_retries, exc,
+                )
+                raise
+    raise last_exc  # should not reach here
+
 
 async def process_and_send_webhook(
     redact_id: str,
@@ -627,8 +765,42 @@ async def process_and_send_webhook(
     Background task that processes the PDF and POSTs the result as JSON
     (base64-encoded PDF) to the callback URL.
     """
+    async with _job_semaphore:
+        await _process_and_send_webhook_inner(
+            redact_id=redact_id,
+            doc_id=doc_id,
+            apr_name=apr_name,
+            bank_cust_no=bank_cust_no,
+            pdf_bytes=pdf_bytes,
+            search_list=search_list,
+            padding=padding,
+            score_tolerance=score_tolerance,
+            filename=filename,
+            callback_url=callback_url,
+            token_manager=token_manager,
+            cache=cache,
+        )
+
+
+async def _process_and_send_webhook_inner(
+    redact_id: str,
+    doc_id: str,
+    apr_name: str,
+    bank_cust_no: str,
+    pdf_bytes: bytes,
+    search_list: List[str],
+    padding: float,
+    score_tolerance: float,
+    filename: str,
+    callback_url: str,
+    token_manager: TokenManager,
+    cache: AzureResultCache = None,
+):
+    """
+    Inner processing logic (called under the concurrency semaphore).
+    """
     logger.info(f"Job {redact_id} started. Processing {filename}.")
-    
+
     try:
         # Validate PDF header
         if not pdf_bytes.startswith(b'%PDF'):
@@ -636,21 +808,33 @@ async def process_and_send_webhook(
         
         logger.info(f"Job {redact_id}: PDF size={len(pdf_bytes)} bytes, header valid")
         
-        # 1. Check MongoDB cache; call Azure only on cache miss
+        # 1. Check cache with distributed lock to prevent duplicate Azure calls
         active_cache = cache or azure_cache_prod
-        result = await active_cache.get(doc_id)
+        status, result = await active_cache.get_or_claim(doc_id)
 
-        if result is None:
-            logger.info(f"Job {redact_id}: Calling Azure DI for doc_id={doc_id}")
-            poller = await azure_client.begin_analyze_document(
-                "prebuilt-layout",
-                AnalyzeDocumentRequest(bytes_source=bytes(pdf_bytes)),
-                locale="tr-TR"
-            )
-            result = await poller.result()
-            await active_cache.put(doc_id, result)
-        else:
+        if status == "hit":
             logger.info(f"Job {redact_id}: Using cached Azure result for doc_id={doc_id}")
+        elif status == "claimed":
+            logger.info(f"Job {redact_id}: Calling Azure DI for doc_id={doc_id}")
+            try:
+                result = await call_azure_with_retry(pdf_bytes)
+                await active_cache.put(doc_id, result)
+            except Exception:
+                await active_cache.release_claim(doc_id)
+                raise
+        elif status == "wait":
+            logger.info(
+                f"Job {redact_id}: Another worker is processing doc_id={doc_id}, polling..."
+            )
+            result = await active_cache.wait_for_result(
+                doc_id, timeout=CACHE_WAIT_TIMEOUT,
+            )
+            if result is None:
+                logger.warning(
+                    f"Job {redact_id}: Timed out waiting, calling Azure DI directly"
+                )
+                result = await call_azure_with_retry(pdf_bytes)
+                await active_cache.put(doc_id, result)
 
         # 2. Process PDF (Offload CPU-bound task to thread)
         redacted_pdf_bytes = await asyncio.to_thread(
@@ -667,9 +851,8 @@ async def process_and_send_webhook(
             logger.info(f"Job {redact_id} saved locally to {output_path}")
 
         # 4. Send Result to Callback URL as JSON with base64-encoded PDF
-        logger.info(f"Job {redact_id} processing complete. Sending to {callback_url}.")
+        logger.info(f"Job {redact_id} processing complete. Sending to callback.")
         secret_token = await token_manager.get_token()
-        logger.info(f"Job {redact_id} header token {secret_token}")
         payload = {
             "redact_id": redact_id,
             "apr_name": apr_name,
@@ -683,24 +866,20 @@ async def process_and_send_webhook(
             "Authorization": f"Bearer {secret_token}"
         }
         logger.info(
-            f"Job {redact_id} sending to callback URL: {callback_url}\n"
-            f"  Request headers: {req_headers}\n"
+            f"Job {redact_id} sending callback to: {callback_url}\n"
             f"  Payload keys: {list(payload.keys())}"
         )
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                callback_url,
-                json=payload,
-                headers=req_headers,
-            )
-            logger.info(
-                f"Job {redact_id} callback response:\n"
-                f"  Status: {response.status_code}\n"
-                f"  Response headers: {dict(response.headers)}\n"
-                f"  Body: {response.text[:10]}"
-            )
-            response.raise_for_status()
-            logger.info(f"Job {redact_id} successfully delivered to webhook.")
+        response = await _post_with_retry(
+            callback_url,
+            json=payload,
+            headers=req_headers,
+            label=f"Job {redact_id} callback",
+        )
+        logger.info(
+            f"Job {redact_id} callback response: status={response.status_code}"
+        )
+        response.raise_for_status()
+        logger.info(f"Job {redact_id} successfully delivered to webhook.")
 
     except Exception as e:
         logger.exception(f"Job {redact_id} failed: {str(e)}")
@@ -719,21 +898,17 @@ async def process_and_send_webhook(
                 "doc_content": None
             }
             logger.info(
-                f"Job {redact_id} sending error callback to: {callback_url}\n"
-                f"  Request headers: {err_headers}"
+                f"Job {redact_id} sending error callback to: {callback_url}"
             )
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                err_response = await client.post(
-                    callback_url,
-                    json=err_payload,
-                    headers=err_headers,
-                )
-                logger.info(
-                    f"Job {redact_id} error callback response:\n"
-                    f"  Status: {err_response.status_code}\n"
-                    f"  Response headers: {dict(err_response.headers)}\n"
-                    f"  Body: {err_response.text[:10]}"
-                )
+            err_response = await _post_with_retry(
+                callback_url,
+                json=err_payload,
+                headers=err_headers,
+                label=f"Job {redact_id} error callback",
+            )
+            logger.info(
+                f"Job {redact_id} error callback response: status={err_response.status_code}"
+            )
         except Exception as webhook_err:
             logger.exception(f"Job {redact_id} failed to send error webhook: {str(webhook_err)}")
 

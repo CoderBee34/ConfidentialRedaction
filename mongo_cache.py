@@ -6,12 +6,15 @@ Uses Motor (async MongoDB driver) to store and retrieve Azure DI
 API calls when the same document is processed more than once.
 """
 
+import asyncio
 import logging
+import time
 import urllib.parse
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Tuple
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from pymongo.errors import DuplicateKeyError
 from azure.ai.documentintelligence.models import AnalyzeResult
 
 logger = logging.getLogger(__name__)
@@ -95,7 +98,7 @@ class AzureResultCache:
         Store an ``AnalyzeResult`` in the cache, keyed by *doc_id*.
 
         Uses an upsert so repeated calls for the same ``doc_id`` simply
-        overwrite the previous entry.
+        overwrite the previous entry.  Clears any processing claim.
         """
         collection = self._db[self._collection_name]
         try:
@@ -105,7 +108,11 @@ class AzureResultCache:
                 {
                     "$set": {
                         "azure_result": serialised,
+                        "status": "ready",
                         "updated_at": datetime.now(timezone.utc),
+                    },
+                    "$unset": {
+                        "claimed_at": "",
                     },
                     "$setOnInsert": {
                         "created_at": datetime.now(timezone.utc),
@@ -117,3 +124,117 @@ class AzureResultCache:
         except Exception:
             # Caching failure should never break the main pipeline
             logger.warning("Failed to cache result for doc_id=%s", doc_id, exc_info=True)
+
+    async def get_or_claim(
+        self, doc_id: str, claim_ttl_seconds: int = 300,
+    ) -> Tuple[str, Optional[AnalyzeResult]]:
+        """
+        Atomically check cache and claim processing rights.
+
+        Prevents duplicate Azure API calls across multiple workers.
+
+        Returns
+        -------
+        ("hit", AnalyzeResult)
+            Cached result found.
+        ("claimed", None)
+            This worker claimed the right to call Azure.
+        ("wait", None)
+            Another worker is already processing this document.
+        """
+        collection = self._db[self._collection_name]
+        now = datetime.now(timezone.utc)
+
+        # 1. Check for an existing document
+        doc = await collection.find_one({"doc_id": doc_id})
+
+        if doc:
+            # Full result already cached
+            if "azure_result" in doc:
+                logger.info("Cache HIT for doc_id=%s", doc_id)
+                return "hit", AnalyzeResult(doc["azure_result"])
+
+            # Document exists but is still being processed
+            claimed_at = doc.get("claimed_at")
+            if claimed_at:
+                # MongoDB may return naive datetimes; treat them as UTC
+                if claimed_at.tzinfo is None:
+                    claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+                age = (now - claimed_at).total_seconds()
+                if age < claim_ttl_seconds:
+                    logger.info(
+                        "doc_id=%s claimed by another worker %ds ago",
+                        doc_id, int(age),
+                    )
+                    return "wait", None
+
+                # Claim has expired — try to re-claim atomically
+                updated = await collection.find_one_and_update(
+                    {"doc_id": doc_id, "claimed_at": claimed_at},
+                    {"$set": {"claimed_at": now}},
+                )
+                if updated:
+                    logger.info("Re-claimed expired doc_id=%s", doc_id)
+                    return "claimed", None
+                # Lost the race; another worker re-claimed first
+                return "wait", None
+
+        # 2. No document yet — insert a processing placeholder
+        try:
+            await collection.insert_one({
+                "doc_id": doc_id,
+                "status": "processing",
+                "claimed_at": now,
+                "created_at": now,
+            })
+            logger.info("Claimed new doc_id=%s for processing", doc_id)
+            return "claimed", None
+        except DuplicateKeyError:
+            # Another worker inserted between our find_one and insert
+            doc = await collection.find_one({"doc_id": doc_id})
+            if doc and "azure_result" in doc:
+                logger.info("Cache HIT (race) for doc_id=%s", doc_id)
+                return "hit", AnalyzeResult(doc["azure_result"])
+            return "wait", None
+
+    async def wait_for_result(
+        self,
+        doc_id: str,
+        timeout: float = 120,
+        initial_interval: float = 1.0,
+        max_interval: float = 5.0,
+    ) -> Optional[AnalyzeResult]:
+        """
+        Poll the cache until a result appears or *timeout* seconds elapse.
+
+        Uses exponential back-off between polls to reduce DB load.
+        """
+        start = time.monotonic()
+        interval = initial_interval
+        while time.monotonic() - start < timeout:
+            result = await self.get(doc_id)
+            if result is not None:
+                return result
+            remaining = timeout - (time.monotonic() - start)
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(interval, remaining))
+            interval = min(interval * 1.5, max_interval)
+
+        logger.warning(
+            "Timed out waiting for doc_id=%s after %.0fs", doc_id, timeout,
+        )
+        return None
+
+    async def release_claim(self, doc_id: str) -> None:
+        """Release a processing claim so another worker can retry."""
+        collection = self._db[self._collection_name]
+        try:
+            await collection.delete_one(
+                {"doc_id": doc_id, "status": "processing"}
+            )
+            logger.info("Released claim for doc_id=%s", doc_id)
+        except Exception:
+            logger.warning(
+                "Failed to release claim for doc_id=%s", doc_id, exc_info=True,
+            )
