@@ -671,11 +671,11 @@ def process_redaction(pdf_bytes: bytes, search_texts: List[str], azure_result,
                     page.add_redact_annot(draw_rect, fill=grey)
 
     for page in doc:
-        page.apply_redactions()
+        page.apply_redactions(images=0)
 
     # Save to memory buffer
     output_buffer = io.BytesIO()
-    doc.save(output_buffer, garbage=4, deflate=True)
+    doc.save(output_buffer, garbage=4, deflate=True, clean=True)
     doc.close()
     return output_buffer.getvalue()
 

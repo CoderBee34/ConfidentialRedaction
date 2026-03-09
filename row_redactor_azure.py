@@ -554,8 +554,8 @@ def _process_with_result(input_path, output_path, search_texts, result,
         print(f"  Kept rows ({len(kept_rows)})  |  Redacted rows: {len(redacted_rows_list)}")
     
     for page in doc:
-        page.apply_redactions()
-    doc.save(output_path, garbage=4, deflate=True)
+        page.apply_redactions(images=0)
+    doc.save(output_path, garbage=4, deflate=True, clean=True)
     doc.close()
     print(f"\nRedacted PDF saved to: {output_path}")
 
